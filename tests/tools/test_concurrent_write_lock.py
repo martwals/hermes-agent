@@ -16,7 +16,8 @@ Covers:
 from __future__ import annotations
 
 import json
-import threading
+import multiprocessing as mp
+import os
 from pathlib import Path
 
 import pytest
@@ -193,38 +194,77 @@ class TestV4aPatchJournals:
 # ── Two-writer concurrency (spec §6a / §6b) ────────────────────────────────
 
 
-def _fresh_ops(tmp_path):
+def _fresh_ops(cwd):
     from tools.environments.local import LocalEnvironment
     from tools.file_operations import ShellFileOperations
-    return ShellFileOperations(LocalEnvironment(cwd=str(tmp_path), timeout=15))
+    return ShellFileOperations(LocalEnvironment(cwd=str(cwd), timeout=15))
+
+
+def _patch_worker(cwd, path, old, new, locks_dir, ready, start):
+    """One real OS process performing a patch-class write (spec §6a).
+
+    Runs under a spawned interpreter: the lock-dir redirect must therefore be
+    delivered via ``HERMES_LOCKS_DIR`` (an env var), not the monkeypatched
+    ``locks_dir`` attribute, which does not cross the process boundary."""
+    os.environ["HERMES_LOCKS_DIR"] = locks_dir
+    ops = _fresh_ops(cwd)
+    ready.set()
+    start.wait()
+    result = ops.patch_replace(path, old, new)
+    if not result.success:
+        raise SystemExit(f"patch failed: {result.error}")
+
+
+def _overwrite_worker(cwd, path, content, locks_dir, ready, start):
+    """One real OS process performing an overwrite-class write (spec §6b)."""
+    os.environ["HERMES_LOCKS_DIR"] = locks_dir
+    ops = _fresh_ops(cwd)
+    ready.set()
+    start.wait()
+    result = ops.write_file(path, content)
+    if result.error is not None:
+        raise SystemExit(f"write failed: {result.error}")
 
 
 class TestConcurrentPatchNoLostUpdate:
-    def test_both_edits_survive(self, locks, tmp_path):
+    def test_both_edits_survive(self, tmp_path):
         target = tmp_path / "shared.txt"
         target.write_text("line1\nline2\nline3\n")
         path = str(target)
+        cwd = str(tmp_path)
+        locks = tmp_path / "locks"
 
-        results = {}
-        barrier = threading.Barrier(2)
+        ctx = mp.get_context("spawn")
+        ready_a, ready_b, start = ctx.Event(), ctx.Event(), ctx.Event()
+        writers = [
+            ctx.Process(target=_patch_worker,
+                        args=(cwd, path, "line1", "line1-A", str(locks), ready_a, start)),
+            ctx.Process(target=_patch_worker,
+                        args=(cwd, path, "line3", "line3-B", str(locks), ready_b, start)),
+        ]
+        for w in writers:
+            w.start()
 
-        def patch_a():
-            ops = _fresh_ops(tmp_path)
-            barrier.wait()
-            results["a"] = ops.patch_replace(path, "line1", "line1-A")
+        try:
+            # Both writers must reach the gate before we release them, so the
+            # two separate OS processes genuinely contend for the flock.
+            assert ready_a.wait(timeout=20), "writer A never reached the gate"
+            assert ready_b.wait(timeout=20), "writer B never reached the gate"
+            start.set()
 
-        def patch_b():
-            ops = _fresh_ops(tmp_path)
-            barrier.wait()
-            results["b"] = ops.patch_replace(path, "line3", "line3-B")
+            for w in writers:
+                w.join(timeout=60)
+            assert all(w.exitcode == 0 for w in writers)
+        finally:
+            # Never leak a live child: a wedged writer (e.g. a genuine flock
+            # deadlock — the exact bug class this test exists to catch) must
+            # surface as a fast assertion failure, not a hung CI job via
+            # multiprocessing's no-timeout atexit join.
+            for w in writers:
+                if w.is_alive():
+                    w.terminate()
+                    w.join(timeout=5)
 
-        ta = threading.Thread(target=patch_a)
-        tb = threading.Thread(target=patch_b)
-        ta.start(); tb.start()
-        ta.join(); tb.join()
-
-        assert results["a"].success
-        assert results["b"].success
         final = target.read_text()
         # No lost update: both independent edits are present.
         assert "line1-A" in final
@@ -235,29 +275,47 @@ class TestConcurrentPatchNoLostUpdate:
 
 
 class TestConcurrentOverwriteLastWriterWins:
-    def test_serialized_lww_and_both_journaled(self, locks, tmp_path):
+    def test_serialized_lww_and_both_journaled(self, tmp_path):
         target = tmp_path / "shared.txt"
         target.write_text("seed\n")
         path = str(target)
+        cwd = str(tmp_path)
+        locks = tmp_path / "locks"
 
         contents = ["AAAA\n", "BBBB\n"]
-        results = {}
-        barrier = threading.Barrier(2)
 
-        def writer(idx):
-            ops = _fresh_ops(tmp_path)
-            barrier.wait()
-            results[idx] = ops.write_file(path, contents[idx])
+        ctx = mp.get_context("spawn")
+        ready_a, ready_b, start = ctx.Event(), ctx.Event(), ctx.Event()
+        writers = [
+            ctx.Process(target=_overwrite_worker,
+                        args=(cwd, path, contents[0], str(locks), ready_a, start)),
+            ctx.Process(target=_overwrite_worker,
+                        args=(cwd, path, contents[1], str(locks), ready_b, start)),
+        ]
+        for w in writers:
+            w.start()
 
-        ta = threading.Thread(target=writer, args=(0,))
-        tb = threading.Thread(target=writer, args=(1,))
-        ta.start(); tb.start()
-        ta.join(); tb.join()
+        try:
+            assert ready_a.wait(timeout=20), "writer A never reached the gate"
+            assert ready_b.wait(timeout=20), "writer B never reached the gate"
+            start.set()
 
-        assert not results[0].error
-        assert not results[1].error
+            for w in writers:
+                w.join(timeout=60)
+            assert all(w.exitcode == 0 for w in writers)
+        finally:
+            # Never leak a live child (see the §6a test): a wedged writer must
+            # become a fast assertion failure, not a hung CI job.
+            for w in writers:
+                if w.is_alive():
+                    w.terminate()
+                    w.join(timeout=5)
+
         final = target.read_text()
         # Serialized last-writer-wins: final content is exactly one writer's.
+        # (Content alone cannot prove serialization — an atomic temp+rename
+        # swap lands as one full write even with no lock; the chain-hash check
+        # below is what proves the ordering.)
         assert final in contents
 
         entries = [r for r in _journal_lines(locks) if r["class"] == "overwrite"]
