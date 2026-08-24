@@ -610,6 +610,28 @@ class WebhookAdapter(BasePlatformAdapter):
         return profile
 
     @staticmethod
+    def _serving_profile_name() -> str:
+        """Return this gateway's serving profile name.
+
+        Mirrors ``hermes_cli.profiles.profiles_to_serve(multiplex=False)``,
+        which resolves ``get_active_profile_name() or "default"``. A bare-path
+        webhook request resolves to this name rather than the literal
+        ``"default"``. Resolution failures fall back to ``"default"`` so a
+        bare-path request degrades to the pre-fix behavior instead of 500ing.
+        """
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            return get_active_profile_name() or "default"
+        except Exception:
+            logger.debug(
+                "webhook: serving-profile resolution failed; "
+                "falling back to 'default'",
+                exc_info=True,
+            )
+            return "default"
+
+    @staticmethod
     def _route_allows_profile(
         route_config: dict,
         request_profile: Optional[str],
@@ -618,6 +640,13 @@ class WebhookAdapter(BasePlatformAdapter):
 
         Omitting ``profile`` keeps a route on the default profile. An explicit
         null, blank, or non-string value is malformed and fails closed.
+
+        A bare-path request (``request_profile`` is ``None``) resolves to the
+        gateway's *serving* profile — ``get_active_profile_name() or
+        "default"`` — not the literal ``"default"``. This is what makes a
+        single-profile gateway (``boole``/``quoins``) match a route bound to
+        its own name on the bare path, matching
+        :func:`hermes_cli.profiles.profiles_to_serve(multiplex=False)`.
         """
         if "profile" not in route_config:
             configured_profile = "default"
@@ -628,7 +657,10 @@ class WebhookAdapter(BasePlatformAdapter):
         configured_profile = configured_profile.strip()
         if not configured_profile:
             return False
-        effective_profile = request_profile or "default"
+        if request_profile is None:
+            effective_profile = WebhookAdapter._serving_profile_name()
+        else:
+            effective_profile = request_profile
         return configured_profile == effective_profile
 
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
@@ -652,7 +684,9 @@ class WebhookAdapter(BasePlatformAdapter):
             )
 
         if not self._route_allows_profile(route_config, profile):
-            effective_profile = profile or "default"
+            effective_profile = (
+                profile if profile is not None else self._serving_profile_name()
+            )
             logger.warning(
                 "[webhook] Route %s is not authorized for profile %r",
                 route_name,
