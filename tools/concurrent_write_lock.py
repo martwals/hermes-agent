@@ -48,8 +48,9 @@ Section-by-section:
   sec. 5 -- Audit journal.
       Append-only ``~/.hermes/locks/write.log``, one JSON line per write:
       timestamp, agent, session id, absolute path, write-class
-      (``patch`` | ``overwrite``), before-hash, after-hash.  Near-zero cost;
-      covers the "who wrote what" failure mode without a coordinator.
+      (``patch`` | ``overwrite``), before-hash, after-hash, locked (bool).
+      Near-zero cost; covers the "who wrote what" failure mode without a
+      coordinator.
 
 Fail-open semantics (mirrors ``cron/jobs.py``): if the lock directory cannot
 be created or the flock cannot be taken, writes still proceed -- a broken lock
@@ -180,7 +181,11 @@ def _hash_text(text: Optional[str]) -> Optional[str]:
     """
     if text is None:
         return None
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    # surrogateescape matches the write path (file_operations.write_file encodes
+    # content with errors="surrogateescape"), so the journal hash of
+    # surrogate-escaped (binary round-trip) content matches the bytes on disk.
+    # Strict UTF-8 here would raise UnicodeEncodeError *after* the write landed.
+    return hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()
 
 
 # ── Re-entrancy tracking (per-thread) ───────────────────────────────────────
