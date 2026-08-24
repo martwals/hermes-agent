@@ -50,6 +50,8 @@ from agent.skill_utils import (
     SKILL_PROMPT_DESC_LIMIT,
 )
 
+from tools.concurrent_write_lock import WriteLock, journal_write, _hash_text
+
 logger = logging.getLogger(__name__)
 
 _background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
@@ -937,16 +939,27 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     skill_dir = _resolve_skill_dir(name, category)
     skill_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write instructional documents with a readable mode while preserving
-    # the mode of an existing file across the atomic replacement.
+    # Write SKILL.md atomically under the concurrent-write lock.  The
+    # before-hash is read inside the lock so a racing concurrent create is
+    # recorded honestly.
     skill_md = skill_dir / "SKILL.md"
-    atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
+    with WriteLock(str(skill_md)) as _wl:
+        _before_hash = _hash_text(
+            skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
+        )
+        atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
+        if _wl.outermost:
+            journal_write(
+                str(skill_md), "overwrite", _before_hash, _hash_text(content),
+                locked=_wl.locked,
+            )
 
-    # Security scan — roll back on block
-    scan_error = _security_scan_skill(skill_dir)
-    if scan_error:
-        shutil.rmtree(skill_dir, ignore_errors=True)
-        return {"success": False, "error": scan_error}
+        # Security scan — roll back on block (still under the lock so the
+        # rollback can't race a concurrent writer).
+        scan_error = _security_scan_skill(skill_dir)
+        if scan_error:
+            shutil.rmtree(skill_dir, ignore_errors=True)
+            return {"success": False, "error": scan_error}
 
     # Extract description from frontmatter for verbose notifications
     _desc = ""
@@ -1031,16 +1044,32 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if read_guard:
         return read_guard
 
-    # Back up original content for rollback
-    original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
-    atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
+    # Back up original content for rollback; write under the concurrent-write
+    # lock (overwrite-class — the lock serializes the write and the journal
+    # records the clobber; lost-update prevention is stat-before-patch).
+    with WriteLock(str(skill_md)) as _wl:
+        original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
+        _before_hash = _hash_text(original_content)
+        atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
+        if _wl.outermost:
+            journal_write(
+                str(skill_md), "overwrite", _before_hash, _hash_text(content),
+                locked=_wl.locked,
+            )
 
-    # Security scan — roll back on block
-    scan_error = _security_scan_skill(existing["path"])
-    if scan_error:
-        if original_content is not None:
-            atomic_write_text(skill_md, original_content, preserve_mode=True)
-        return {"success": False, "error": scan_error}
+        # Security scan — roll back on block (still under the lock so the
+        # rollback can't race a concurrent writer).
+        scan_error = _security_scan_skill(existing["path"])
+        if scan_error:
+            if original_content is not None:
+                atomic_write_text(skill_md, original_content, preserve_mode=True)
+                if _wl.outermost:
+                    journal_write(
+                        str(skill_md), "overwrite",
+                        _hash_text(content), _hash_text(original_content),
+                        locked=_wl.locked,
+                    )
+            return {"success": False, "error": scan_error}
 
     # Extract description from new content for verbose notifications
     _desc = ""
@@ -1120,55 +1149,72 @@ def _patch_skill(
     if read_guard:
         return read_guard
 
-    content = target.read_text(encoding="utf-8")
+    # Concurrent-write lock (patch-class): the flock spans the read → modify
+    # → write cycle so a concurrent writer can't interleave between our read
+    # and our write.
+    with WriteLock(str(target)) as _wl:
+        content = target.read_text(encoding="utf-8")
+        _before_hash = _hash_text(content)
 
-    # Use the same fuzzy matching engine as the file patch tool.
-    # This handles whitespace normalization, indentation differences,
-    # escape sequences, and block-anchor matching — saving the agent
-    # from exact-match failures on minor formatting mismatches.
-    from tools.fuzzy_match import fuzzy_find_and_replace
+        # Use the same fuzzy matching engine as the file patch tool.
+        # This handles whitespace normalization, indentation differences,
+        # escape sequences, and block-anchor matching — saving the agent
+        # from exact-match failures on minor formatting mismatches.
+        from tools.fuzzy_match import fuzzy_find_and_replace
 
-    new_content, match_count, _strategy, match_error = fuzzy_find_and_replace(
-        content, old_string, new_string, replace_all
-    )
-    if match_error:
-        # Show a short preview of the file so the model can self-correct
-        preview = content[:500] + ("..." if len(content) > 500 else "")
-        err_msg = match_error
-        try:
-            from tools.fuzzy_match import format_no_match_hint
-            err_msg += format_no_match_hint(match_error, match_count, old_string, content)
-        except Exception:
-            pass
-        return {
-            "success": False,
-            "error": err_msg,
-            "file_preview": preview,
-        }
-
-    # Check size limit on the result
-    target_label = "SKILL.md" if not file_path else file_path
-    err = _validate_content_size(new_content, label=target_label)
-    if err:
-        return {"success": False, "error": err}
-
-    # If patching SKILL.md, validate frontmatter is still intact
-    if not file_path:
-        err = _validate_frontmatter(new_content)
-        if err:
+        new_content, match_count, _strategy, match_error = fuzzy_find_and_replace(
+            content, old_string, new_string, replace_all
+        )
+        if match_error:
+            # Show a short preview of the file so the model can self-correct
+            preview = content[:500] + ("..." if len(content) > 500 else "")
+            err_msg = match_error
+            try:
+                from tools.fuzzy_match import format_no_match_hint
+                err_msg += format_no_match_hint(match_error, match_count, old_string, content)
+            except Exception:
+                pass
             return {
                 "success": False,
-                "error": f"Patch would break SKILL.md structure: {err}",
+                "error": err_msg,
+                "file_preview": preview,
             }
 
-    original_content = content  # for rollback
-    atomic_write_text(target, new_content, preserve_mode=True, create_mode=0o644)
+        # Check size limit on the result
+        target_label = "SKILL.md" if not file_path else file_path
+        err = _validate_content_size(new_content, label=target_label)
+        if err:
+            return {"success": False, "error": err}
 
-    # Security scan — roll back on block
-    scan_error = _security_scan_skill(skill_dir)
-    if scan_error:
-        atomic_write_text(target, original_content, preserve_mode=True)
-        return {"success": False, "error": scan_error}
+        # If patching SKILL.md, validate frontmatter is still intact
+        if not file_path:
+            err = _validate_frontmatter(new_content)
+            if err:
+                return {
+                    "success": False,
+                    "error": f"Patch would break SKILL.md structure: {err}",
+                }
+
+        original_content = content  # for rollback
+        atomic_write_text(target, new_content, preserve_mode=True, create_mode=0o644)
+        if _wl.outermost:
+            journal_write(
+                str(target), "patch", _before_hash, _hash_text(new_content),
+                locked=_wl.locked,
+            )
+
+        # Security scan — roll back on block (still under the lock so the
+        # rollback can't race a concurrent writer).
+        scan_error = _security_scan_skill(skill_dir)
+        if scan_error:
+            atomic_write_text(target, original_content, preserve_mode=True)
+            if _wl.outermost:
+                journal_write(
+                    str(target), "overwrite",
+                    _hash_text(new_content), _hash_text(original_content),
+                    locked=_wl.locked,
+                )
+            return {"success": False, "error": scan_error}
 
     result = {
         "success": True,
@@ -1339,18 +1385,33 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         if read_guard:
             return read_guard
     target.parent.mkdir(parents=True, exist_ok=True)
-    # Back up for rollback
-    original_content = target.read_text(encoding="utf-8") if target.exists() else None
-    atomic_write_text(target, file_content, preserve_mode=True, create_mode=0o644)
+    # Back up for rollback; write under the concurrent-write lock
+    # (overwrite-class).
+    with WriteLock(str(target)) as _wl:
+        original_content = target.read_text(encoding="utf-8") if target.exists() else None
+        _before_hash = _hash_text(original_content)
+        atomic_write_text(target, file_content, preserve_mode=True, create_mode=0o644)
+        if _wl.outermost:
+            journal_write(
+                str(target), "overwrite", _before_hash, _hash_text(file_content),
+                locked=_wl.locked,
+            )
 
-    # Security scan — roll back on block
-    scan_error = _security_scan_skill(existing["path"])
-    if scan_error:
-        if original_content is not None:
-            atomic_write_text(target, original_content, preserve_mode=True)
-        else:
-            target.unlink(missing_ok=True)
-        return {"success": False, "error": scan_error}
+        # Security scan — roll back on block (still under the lock so the
+        # rollback can't race a concurrent writer).
+        scan_error = _security_scan_skill(existing["path"])
+        if scan_error:
+            if original_content is not None:
+                atomic_write_text(target, original_content, preserve_mode=True)
+                if _wl.outermost:
+                    journal_write(
+                        str(target), "overwrite",
+                        _hash_text(file_content), _hash_text(original_content),
+                        locked=_wl.locked,
+                    )
+            else:
+                target.unlink(missing_ok=True)
+            return {"success": False, "error": scan_error}
 
     result = {
         "success": True,
