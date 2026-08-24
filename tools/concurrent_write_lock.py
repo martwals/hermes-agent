@@ -30,14 +30,20 @@ Section-by-section:
 
   sec. 4 -- Two write classes.
       patch-class (``patch``, ``skill_manage patch``) re-reads the target
-      inside the lock and applies a diff; holding flock across that cycle
-      closes the race fully, and a fuzzy-match miss is a *safe* failure.
+      inside the lock, applies a diff, and verifies the result; the critical
+      section is read -> modify -> write -> verify.  Holding flock across that
+      cycle closes the race fully, and a fuzzy-match miss is a *safe* failure.
       overwrite-class (``write_file``, ``skill_manage edit``) writes complete
-      content with no re-read, so flock serializes but cannot recover a lost
-      update the agent already baked in upstream -- the stat-before-patch
-      convention (``file_state.check_stale``) is the permanent protection for
-      that class.  The ``write_class`` tag recorded in the journal is what
-      makes the distinction auditable.
+      content and verifies the result; the critical section is write -> verify.
+      flock serializes but cannot recover a lost update the agent already baked
+      in upstream -- the stat-before-patch convention (``file_state.check_stale``)
+      is the permanent protection for that class.  Verification is the terminal
+      read of the same cycle and lives *inside* the lock (Sec.4 amendment):
+      "did MY write land?" is only answerable while the lock is held -- the
+      observed state must be post-my-write and pre-any-other-writer; after
+      release a concurrent lock-holder can rewrite in the gap.  The
+      ``write_class`` tag recorded in the journal is what makes the distinction
+      auditable.
 
   sec. 5 -- Audit journal.
       Append-only ``~/.hermes/locks/write.log``, one JSON line per write:

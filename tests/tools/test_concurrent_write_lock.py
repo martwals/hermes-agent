@@ -267,3 +267,59 @@ class TestConcurrentOverwriteLastWriterWins:
         afters = {e["after"] for e in entries}
         befores = {e["before"] for e in entries if e["before"]}
         assert afters & befores  # one writer's output is another's input
+
+
+# ── Sec.4 amendment: verification inside the critical section ──────────────
+
+
+class TestVerificationJournalOrdering:
+    """Sec.4 amendment: verification runs inside the critical section, and the
+    journal is written only after verification passes — a failed-persistence
+    write is never recorded as a clean "after" hash."""
+
+    def test_overwrite_verification_failure_skips_journal(self, locks, ops, tmp_path):
+        from tools.file_operations import ExecuteResult
+
+        target = tmp_path / "notes.txt"
+        target.write_text("original\n")
+        path = str(target)
+
+        real_exec = ops._exec
+
+        def fake_exec(command, *args, **kwargs):
+            if command.startswith("sha256sum"):
+                # Report a well-formed but wrong digest: the write "did not
+                # persist" from the verifier's point of view.
+                return ExecuteResult(stdout="0" * 64 + f"  {path}\n", exit_code=0)
+            return real_exec(command, *args, **kwargs)
+
+        ops._exec = fake_exec
+
+        result = ops.write_file(path, "replacement\n")
+
+        assert result.error is not None
+        assert "verification failed" in result.error
+        # A failed-persistence write is never recorded as a clean after-hash.
+        assert _journal_lines(locks) == []
+
+    def test_patch_verification_failure_skips_journal(self, locks, ops, tmp_path):
+        from tools.file_operations import WriteResult
+
+        target = tmp_path / "notes.txt"
+        target.write_text("alpha\nbravo\n")
+        path = str(target)
+
+        # write_file is a no-op here: it reports success but does not touch
+        # disk, so patch_replace's post-write re-read sees the ORIGINAL
+        # content and the verification fails.
+        def fake_write_file(p, content, pre_content=None):
+            return WriteResult(bytes_written=len(content), verified=True)
+
+        ops.write_file = fake_write_file
+
+        result = ops.patch_replace(path, "bravo", "BRAVO")
+
+        assert result.success is False
+        assert result.error is not None
+        assert "verification failed" in result.error
+        assert _journal_lines(locks) == []

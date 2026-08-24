@@ -2143,13 +2143,48 @@ class ShellFileOperations(FileOperations):
         # Lost-update prevention for this class is stat-before-patch
         # (file_state.check_stale) — the lock only serializes, per the
         # adopted two-write-class contract.
+        #
+        # Sec.4 amendment (Boole 2026-08-24): the overwrite-class critical
+        # section is write → verify, NOT write → (release) → verify.  "Did MY
+        # write land?" is only answerable while the lock is held — the
+        # observed state must be post-my-write and pre-any-other-writer; after
+        # release a concurrent lock-holder can rewrite in the gap and the check
+        # degenerates into lost-update detection (check_stale's job, already
+        # done upstream).
+        content_verified: Optional[bool] = None
         with WriteLock(path) as _wl:
             # Only read the before-hash when we'll actually journal (outermost
             # acquisition) — the nested patch→write_file case already captured
             # it in patch_replace.
             _before_hash = _hash_text(self._read_current(path)) if _wl.outermost else None
             write_result = self._atomic_write(path, content)
-            if _wl.outermost and write_result.exit_code == 0:
+
+            # Post-write verification INSIDE the critical section (cheap, one
+            # shell call): compare the on-disk sha256 to the intended content's
+            # hash.  A mismatch is surfaced as a hard error rather than silent
+            # corruption (mirrors patch_replace's post-write verification).
+            if write_result.exit_code == 0:
+                try:
+                    hash_cmd = f"sha256sum {self._escape_shell_arg(path)} 2>/dev/null"
+                    hash_result = self._exec(hash_cmd)
+                    if hash_result.exit_code == 0 and hash_result.stdout.strip():
+                        disk_sha = hash_result.stdout.strip().split()[0]
+                        expected_sha = hashlib.sha256(content_bytes).hexdigest()
+                        content_verified = disk_sha == expected_sha
+                except Exception:
+                    content_verified = None
+
+            # Journal AFTER verification: a failed-persistence write
+            # (content_verified is False) is never recorded as a clean "after"
+            # hash — the journal previously preceded verification, so a write
+            # that didn't land still logged a clean digest.  When verification
+            # could not run (None) we still log the intended hash (best-effort:
+            # the write path is otherwise healthy).
+            if (
+                _wl.outermost
+                and write_result.exit_code == 0
+                and content_verified is not False
+            ):
                 journal_write(
                     path, "overwrite", _before_hash, _hash_text(content),
                     locked=_wl.locked,
@@ -2162,36 +2197,21 @@ class ShellFileOperations(FileOperations):
         # matches wc -c) instead of spawning a ``wc -c`` subprocess. The
         # encode happened up front with surrogateescape — the inverse of the
         # decode that produces surrogate content — so content_bytes == what
-        # rode stdin == what is on disk, and the sha256 below compares like
+        # rode stdin == what is on disk, and the sha256 above compares like
         # with like.
         bytes_written = len(content_bytes)
 
-        # Post-write content verification (cheap, one shell call): compare
-        # the on-disk sha256 to the intended content's hash. Production
-        # mining shows models re-reading files right after writing them to
-        # confirm persistence (154 verify-reads in a 400k-msg window) —
-        # an explicit verified flag makes that turn unnecessary, and a
-        # mismatch is surfaced as a hard error instead of silent corruption
-        # (mirrors patch_replace's post-write verification).
-        content_verified: Optional[bool] = None
-        try:
-            hash_cmd = f"sha256sum {self._escape_shell_arg(path)} 2>/dev/null"
-            hash_result = self._exec(hash_cmd)
-            if hash_result.exit_code == 0 and hash_result.stdout.strip():
-                disk_sha = hash_result.stdout.strip().split()[0]
-                expected_sha = hashlib.sha256(content_bytes).hexdigest()
-                content_verified = disk_sha == expected_sha
-                if not content_verified:
-                    return WriteResult(
-                        error=(
-                            f"Post-write verification failed for {path}: on-disk "
-                            "content hash differs from the intended write. The "
-                            "write did not persist correctly — re-read the file "
-                            "and retry."
-                        )
-                    )
-        except Exception:
-            content_verified = None
+        # A verification mismatch is a hard error (the flag was computed
+        # inside the lock above, and the journal was already skipped for it).
+        if content_verified is False:
+            return WriteResult(
+                error=(
+                    f"Post-write verification failed for {path}: on-disk "
+                    "content hash differs from the intended write. The "
+                    "write did not persist correctly — re-read the file "
+                    "and retry."
+                )
+            )
 
         # Post-write lint with delta refinement.
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
@@ -2323,44 +2343,50 @@ class ShellFileOperations(FileOperations):
             if write_result.error:
                 return PatchResult(error=f"Failed to write changes: {write_result.error}")
 
-            # Audit journal (spec §5) — patch-class entry.
-            if _wl.outermost:
+            # Post-write verification INSIDE the critical section (Sec.4
+            # amendment) — re-read the file and confirm the bytes we intended
+            # to write actually landed, while the lock is still held so no
+            # other writer can have rewritten in between.  Catches silent
+            # persistence failures (backend FS oddities, truncated pipe, etc.)
+            # that would otherwise return success-with-diff while the file is
+            # unchanged on disk.
+            verify_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+            verify_result = self._exec(verify_cmd)
+            if verify_result.exit_code != 0:
+                return PatchResult(error=f"Post-write verification failed: could not re-read {path}")
+            # Normalize line endings before comparing.  On Windows, Python's
+            # default text-mode ``open()`` translates ``\n`` → ``\r\n`` on
+            # write, so the file on disk legitimately holds CRLFs while our
+            # ``new_content`` string has bare LFs.  Without this normalization
+            # every patch on Windows returns a bogus "wrote 39, read 42"
+            # false-negative even though the edit landed correctly.  POSIX
+            # backends don't translate, so this is a no-op there.  We also
+            # strip a leading BOM from the re-read: write_file restored the
+            # marker on disk but ``new_content`` is the BOM-less string we
+            # matched against, so the comparison must drop it to stay
+            # apples-to-apples.
+            _verify_bomless, _ = _strip_bom(verify_result.stdout)
+            _verify_stdout_normalized = _verify_bomless.replace("\r\n", "\n").replace("\r", "\n")
+            _new_content_normalized = new_content.replace("\r\n", "\n").replace("\r", "\n")
+            verified_ok = _verify_stdout_normalized == _new_content_normalized
+
+            # Audit journal (spec §5) — patch-class entry, written AFTER
+            # verification so a failed-persistence write is never recorded as
+            # a clean "after" hash.
+            if _wl.outermost and verified_ok:
                 journal_write(
                     path, "patch", _before_hash, _hash_text(new_content),
                     locked=_wl.locked,
                 )
 
-        # Post-write verification — re-read the file and confirm the bytes we
-        # intended to write actually landed. Catches silent persistence
-        # failures (backend FS oddities, race with another task, truncated
-        # pipe, etc.) that would otherwise return success-with-diff while the
-        # file is unchanged on disk.
-        verify_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-        verify_result = self._exec(verify_cmd)
-        if verify_result.exit_code != 0:
-            return PatchResult(error=f"Post-write verification failed: could not re-read {path}")
-        # Normalize line endings before comparing.  On Windows, Python's
-        # default text-mode ``open()`` translates ``\n`` → ``\r\n`` on
-        # write, so the file on disk legitimately holds CRLFs while our
-        # ``new_content`` string has bare LFs.  Without this normalization
-        # every patch on Windows returns a bogus "wrote 39, read 42"
-        # false-negative even though the edit landed correctly.  POSIX
-        # backends don't translate, so this is a no-op there.  We also
-        # strip a leading BOM from the re-read: write_file restored the
-        # marker on disk but ``new_content`` is the BOM-less string we
-        # matched against, so the comparison must drop it to stay
-        # apples-to-apples.
-        _verify_bomless, _ = _strip_bom(verify_result.stdout)
-        _verify_stdout_normalized = _verify_bomless.replace("\r\n", "\n").replace("\r", "\n")
-        _new_content_normalized = new_content.replace("\r\n", "\n").replace("\r", "\n")
-        if _verify_stdout_normalized != _new_content_normalized:
-            return PatchResult(error=(
-                f"Post-write verification failed for {path}: on-disk content "
-                f"differs from intended write "
-                f"(wrote {len(_new_content_normalized)} chars, read back "
-                f"{len(_verify_stdout_normalized)} chars after normalizing line endings). "
-                "The patch did not persist. Re-read the file and try again."
-            ))
+            if not verified_ok:
+                return PatchResult(error=(
+                    f"Post-write verification failed for {path}: on-disk content "
+                    f"differs from intended write "
+                    f"(wrote {len(_new_content_normalized)} chars, read back "
+                    f"{len(_verify_stdout_normalized)} chars after normalizing line endings). "
+                    "The patch did not persist. Re-read the file and try again."
+                ))
 
         # Generate diff
         diff = self._unified_diff(content, new_content, path)
