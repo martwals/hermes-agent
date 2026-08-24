@@ -138,8 +138,17 @@ def _resolve_session_id() -> str:
 # ── Lock directory / sidecar path ───────────────────────────────────────────
 def locks_dir() -> Path:
     """Return the shared lock directory (``~/.hermes/locks`` in the standard
-    layout).  Lazily imported so this module never forces an import cycle at
-    load time."""
+    layout).
+
+    ``HERMES_LOCKS_DIR`` overrides the location.  It is deliberately an env
+    var rather than an in-process hook: the two-writer verification test
+    (spec §6) spawns separate OS processes that must agree on the lock dir
+    without sharing monkeypatched state across the process boundary.  The
+    default path is resolved lazily so this module never forces an import
+    cycle at load time."""
+    override = os.environ.get("HERMES_LOCKS_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
     from hermes_constants import get_default_hermes_root
     return get_default_hermes_root() / "locks"
 
