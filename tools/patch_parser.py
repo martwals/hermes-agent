@@ -614,117 +614,132 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optiona
     """
     # Deferred import: breaks the patch_parser ↔ fuzzy_match circular dependency
     from tools.fuzzy_match import fuzzy_find_and_replace
+    from tools.concurrent_write_lock import WriteLock, journal_write, _hash_text
 
-    # Read current content — raw so no line-number prefixes or per-line truncation
-    read_result = file_ops.read_file_raw(op.file_path)
+    # Expand ``~`` (the same normalization write_file applies internally) so
+    # the outer lock and the nested write_file lock hash to the SAME sidecar.
+    _expand = getattr(file_ops, "_expand_path", None)
+    resolved_path = _expand(op.file_path) if _expand is not None else op.file_path
 
-    if read_result.error:
-        return False, f"Cannot read file: {read_result.error}", None, None
+    # patch-class: hold the flock across the read → modify → write cycle so a
+    # concurrent writer can't interleave between our read and our write.
+    with WriteLock(resolved_path) as _wl:
+        # Read current content — raw so no line-number prefixes or per-line truncation
+        read_result = file_ops.read_file_raw(resolved_path)
 
-    current_content = read_result.content
+        if read_result.error:
+            return False, f"Cannot read file: {read_result.error}", None, None
 
-    # Apply each hunk
-    new_content = current_content
+        current_content = read_result.content
+        _before_hash = _hash_text(current_content)
 
-    for hunk in op.hunks:
-        # Build search pattern from context and removed lines
-        search_lines = []
-        replace_lines = []
+        # Apply each hunk
+        new_content = current_content
 
-        for line in hunk.lines:
-            if line.prefix == ' ':
-                search_lines.append(line.content)
-                replace_lines.append(line.content)
-            elif line.prefix == '-':
-                search_lines.append(line.content)
-            elif line.prefix == '+':
-                replace_lines.append(line.content)
+        for hunk in op.hunks:
+            # Build search pattern from context and removed lines
+            search_lines = []
+            replace_lines = []
 
-        if search_lines and search_lines == replace_lines:
-            continue
-        if search_lines:
-            search_pattern = '\n'.join(search_lines)
-            replacement = '\n'.join(replace_lines)
+            for line in hunk.lines:
+                if line.prefix == ' ':
+                    search_lines.append(line.content)
+                    replace_lines.append(line.content)
+                elif line.prefix == '-':
+                    search_lines.append(line.content)
+                elif line.prefix == '+':
+                    replace_lines.append(line.content)
 
-            new_content, count, _strategy, error = fuzzy_find_and_replace(
-                new_content, search_pattern, replacement, replace_all=False
+            if search_lines and search_lines == replace_lines:
+                continue
+            if search_lines:
+                search_pattern = '\n'.join(search_lines)
+                replacement = '\n'.join(replace_lines)
+
+                new_content, count, _strategy, error = fuzzy_find_and_replace(
+                    new_content, search_pattern, replacement, replace_all=False
+                )
+
+                if error and count == 0:
+                    # Try with context hint if available
+                    if hunk.context_hint:
+                        # Find the context hint location and search nearby
+                        hint_pos = new_content.find(hunk.context_hint)
+                        if hint_pos != -1:
+                            # Search in a window around the hint
+                            window_start = max(0, hint_pos - 500)
+                            window_end = min(len(new_content), hint_pos + 2000)
+                            window = new_content[window_start:window_end]
+
+                            window_new, count, _strategy, error = fuzzy_find_and_replace(
+                                window, search_pattern, replacement, replace_all=False
+                            )
+
+                            if count > 0:
+                                new_content = new_content[:window_start] + window_new + new_content[window_end:]
+                                error = None
+
+                    if error:
+                        # Already-applied hunk: skip it, mirroring the
+                        # validation-phase check (validation may also have
+                        # passed via this path, so apply MUST skip too or the
+                        # two phases disagree and the whole patch fails here).
+                        from tools.fuzzy_match import is_already_applied
+                        if is_already_applied(new_content, search_pattern, replacement):
+                            continue
+                        err_msg = f"Could not apply hunk: {error}"
+                        try:
+                            from tools.fuzzy_match import format_no_match_hint
+                            err_msg += format_no_match_hint(error, 0, search_pattern, new_content)
+                        except Exception:
+                            pass
+                        return False, err_msg, None, None
+            else:
+                # Addition-only hunk (no context or removed lines).
+                # Insert at the location indicated by the context hint, or at end of file.
+                insert_text = '\n'.join(replace_lines)
+                if hunk.context_hint:
+                    occurrences = _count_occurrences(new_content, hunk.context_hint)
+                    if occurrences == 0:
+                        # Hint not found — append at end as a safe fallback
+                        new_content = new_content.rstrip('\n') + '\n' + insert_text + '\n'
+                    elif occurrences > 1:
+                        return False, (
+                            f"Addition-only hunk: context hint '{hunk.context_hint}' is ambiguous "
+                            f"({occurrences} occurrences) — provide a more unique hint"
+                        ), None, None
+                    else:
+                        hint_pos = new_content.find(hunk.context_hint)
+                        # Insert after the line containing the context hint
+                        eol = new_content.find('\n', hint_pos)
+                        if eol != -1:
+                            new_content = new_content[:eol + 1] + insert_text + '\n' + new_content[eol + 1:]
+                        else:
+                            new_content = new_content + '\n' + insert_text
+                else:
+                    new_content = new_content.rstrip('\n') + '\n' + insert_text + '\n'
+
+        # Write new content — pass current_content (already read above) to avoid
+        # a redundant cat subprocess inside write_file.  Fall back to the
+        # two-argument form when the file_ops implementation doesn't accept
+        # ``pre_content`` (duck-typed callers that only implement the basic
+        # ``write_file(path, content)`` contract).  Feature-detect via the
+        # signature instead of catching TypeError around the call: a TypeError
+        # raised *inside* a pre_content-capable write_file must propagate, not
+        # trigger a second (double) write.
+        if _write_file_accepts_pre_content(file_ops):
+            write_result = file_ops.write_file(resolved_path, new_content,
+                                               pre_content=current_content)
+        else:
+            write_result = file_ops.write_file(resolved_path, new_content)
+        if write_result.error:
+            return False, write_result.error, None, None
+        if _wl.outermost:
+            journal_write(
+                resolved_path, "patch", _before_hash, _hash_text(new_content),
+                locked=_wl.locked,
             )
 
-            if error and count == 0:
-                # Try with context hint if available
-                if hunk.context_hint:
-                    # Find the context hint location and search nearby
-                    hint_pos = new_content.find(hunk.context_hint)
-                    if hint_pos != -1:
-                        # Search in a window around the hint
-                        window_start = max(0, hint_pos - 500)
-                        window_end = min(len(new_content), hint_pos + 2000)
-                        window = new_content[window_start:window_end]
-
-                        window_new, count, _strategy, error = fuzzy_find_and_replace(
-                            window, search_pattern, replacement, replace_all=False
-                        )
-                        
-                        if count > 0:
-                            new_content = new_content[:window_start] + window_new + new_content[window_end:]
-                            error = None
-                
-                if error:
-                    # Already-applied hunk: skip it, mirroring the
-                    # validation-phase check (validation may also have
-                    # passed via this path, so apply MUST skip too or the
-                    # two phases disagree and the whole patch fails here).
-                    from tools.fuzzy_match import is_already_applied
-                    if is_already_applied(new_content, search_pattern, replacement):
-                        continue
-                    err_msg = f"Could not apply hunk: {error}"
-                    try:
-                        from tools.fuzzy_match import format_no_match_hint
-                        err_msg += format_no_match_hint(error, 0, search_pattern, new_content)
-                    except Exception:
-                        pass
-                    return False, err_msg, None, None
-        else:
-            # Addition-only hunk (no context or removed lines).
-            # Insert at the location indicated by the context hint, or at end of file.
-            insert_text = '\n'.join(replace_lines)
-            if hunk.context_hint:
-                occurrences = _count_occurrences(new_content, hunk.context_hint)
-                if occurrences == 0:
-                    # Hint not found — append at end as a safe fallback
-                    new_content = new_content.rstrip('\n') + '\n' + insert_text + '\n'
-                elif occurrences > 1:
-                    return False, (
-                        f"Addition-only hunk: context hint '{hunk.context_hint}' is ambiguous "
-                        f"({occurrences} occurrences) — provide a more unique hint"
-                    ), None, None
-                else:
-                    hint_pos = new_content.find(hunk.context_hint)
-                    # Insert after the line containing the context hint
-                    eol = new_content.find('\n', hint_pos)
-                    if eol != -1:
-                        new_content = new_content[:eol + 1] + insert_text + '\n' + new_content[eol + 1:]
-                    else:
-                        new_content = new_content + '\n' + insert_text
-            else:
-                new_content = new_content.rstrip('\n') + '\n' + insert_text + '\n'
-    
-    # Write new content — pass current_content (already read above) to avoid
-    # a redundant cat subprocess inside write_file.  Fall back to the
-    # two-argument form when the file_ops implementation doesn't accept
-    # ``pre_content`` (duck-typed callers that only implement the basic
-    # ``write_file(path, content)`` contract).  Feature-detect via the
-    # signature instead of catching TypeError around the call: a TypeError
-    # raised *inside* a pre_content-capable write_file must propagate, not
-    # trigger a second (double) write.
-    if _write_file_accepts_pre_content(file_ops):
-        write_result = file_ops.write_file(op.file_path, new_content,
-                                           pre_content=current_content)
-    else:
-        write_result = file_ops.write_file(op.file_path, new_content)
-    if write_result.error:
-        return False, write_result.error, None, None
-    
     # Generate diff
     diff_lines = difflib.unified_diff(
         current_content.splitlines(keepends=True),
@@ -733,5 +748,5 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optiona
         tofile=f"b/{op.file_path}"
     )
     diff = ''.join(diff_lines)
-    
+
     return True, diff, getattr(write_result, "lsp_diagnostics", None), getattr(write_result, "lint", None)

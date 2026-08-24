@@ -46,6 +46,8 @@ from agent.file_safety import (
     is_write_denied as _shared_is_write_denied,
 )
 
+from tools.concurrent_write_lock import WriteLock, journal_write, _hash_text
+
 
 # ---------------------------------------------------------------------------
 # Write-path deny list — blocks writes to sensitive system/credential files
@@ -1913,6 +1915,23 @@ class ShellFileOperations(FileOperations):
     # WRITE Implementation
     # =========================================================================
 
+    def _read_current(self, path: str) -> Optional[str]:
+        """Best-effort read of the current on-disk content for hashing.
+
+        Used to capture the ``before`` hash for the concurrent-write audit
+        journal.  Never raises; returns ``None`` when the file is missing or
+        unreadable (the journal records ``null`` for "no prior content" rather
+        than fabricating an empty-file hash).
+        """
+        try:
+            read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+            read_result = self._exec(read_cmd)
+            if read_result.exit_code == 0:
+                return read_result.stdout
+        except Exception:
+            pass
+        return None
+
     def write_file(self, path: str, content: str,
                    pre_content: Optional[str] = None) -> WriteResult:
         """
@@ -2117,7 +2136,24 @@ class ShellFileOperations(FileOperations):
                     "UTF-8. The file was NOT created or modified."
                 )
             )
-        write_result = self._atomic_write(path, content)
+        # ── Concurrent-write lock + journal (spec §3–§5) ─────────────────
+        # overwrite-class: flock serializes the write so two sessions can't
+        # interleave a temp-file+rename on the same path, and before/after
+        # hashes record the write (and any clobber) in the audit journal.
+        # Lost-update prevention for this class is stat-before-patch
+        # (file_state.check_stale) — the lock only serializes, per the
+        # adopted two-write-class contract.
+        with WriteLock(path) as _wl:
+            # Only read the before-hash when we'll actually journal (outermost
+            # acquisition) — the nested patch→write_file case already captured
+            # it in patch_replace.
+            _before_hash = _hash_text(self._read_current(path)) if _wl.outermost else None
+            write_result = self._atomic_write(path, content)
+            if _wl.outermost and write_result.exit_code == 0:
+                journal_write(
+                    path, "overwrite", _before_hash, _hash_text(content),
+                    locked=_wl.locked,
+                )
 
         if write_result.exit_code != 0:
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
@@ -2208,76 +2244,91 @@ class ShellFileOperations(FileOperations):
         if denied:
             return PatchResult(error=denied)
 
-        # Read current content
-        read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-        read_result = self._exec(read_cmd)
-        
-        if read_result.exit_code != 0:
-            return PatchResult(error=f"Failed to read file: {path}")
-        
-        content = read_result.stdout
-        # Preserve raw content (including BOM) for write_file's pre_content
-        # so write_file can detect/restore BOM correctly.
-        raw_content = content
-        # Strip a leading UTF-8 BOM before matching so the fuzzy matcher and
-        # the diff operate on clean content (a phantom U+FEFF before line 1
-        # defeats an exact first-line match). write_file restores the BOM on
-        # the way back out by re-probing the on-disk file, so the round-trip
-        # preserves the marker.
-        content, _ = _strip_bom(content)
+        # ── Concurrent-write lock (spec §3) ─────────────────────────────
+        # patch-class: the flock spans the entire read → modify → write
+        # cycle, so a concurrent writer cannot interleave between our read
+        # and our write (which would clobber their update).  A fuzzy-match
+        # miss on a moved region is a *safe* failure — it surfaces the
+        # conflict instead of silently clobbering.
+        with WriteLock(path) as _wl:
+            # Read current content
+            read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+            read_result = self._exec(read_cmd)
 
-        # Import and use fuzzy matching
-        from tools.fuzzy_match import fuzzy_find_and_replace
-        
-        new_content, match_count, _strategy, error = fuzzy_find_and_replace(
-            content, old_string, new_string, replace_all
-        )
-        
-        if error or match_count == 0:
-            # Already-applied detection: the most common patch failure in
-            # production is a re-send of an edit that has already landed
-            # (identical old/new strings, or old_string gone while
-            # new_string is present verbatim). Surface that as an explicit
-            # success-shaped no-op so the model moves on instead of
-            # burning turns on re-reads and re-patches.
-            from tools.fuzzy_match import is_already_applied
-            if is_already_applied(content, old_string, new_string):
-                return PatchResult(
-                    success=True,
-                    no_change=True,
-                    note=(
-                        f"File already contains the target text — the edit "
-                        f"appears to be already applied to {path}. No write "
-                        "performed; do not re-send this patch."
-                    ),
+            if read_result.exit_code != 0:
+                return PatchResult(error=f"Failed to read file: {path}")
+
+            content = read_result.stdout
+            # Preserve raw content (including BOM) for write_file's pre_content
+            # so write_file can detect/restore BOM correctly.
+            raw_content = content
+            # Strip a leading UTF-8 BOM before matching so the fuzzy matcher and
+            # the diff operate on clean content (a phantom U+FEFF before line 1
+            # defeats an exact first-line match). write_file restores the BOM on
+            # the way back out by re-probing the on-disk file, so the round-trip
+            # preserves the marker.
+            content, _ = _strip_bom(content)
+            _before_hash = _hash_text(content)
+
+            # Import and use fuzzy matching
+            from tools.fuzzy_match import fuzzy_find_and_replace
+
+            new_content, match_count, _strategy, error = fuzzy_find_and_replace(
+                content, old_string, new_string, replace_all
+            )
+
+            if error or match_count == 0:
+                # Already-applied detection: the most common patch failure in
+                # production is a re-send of an edit that has already landed
+                # (identical old/new strings, or old_string gone while
+                # new_string is present verbatim). Surface that as an explicit
+                # success-shaped no-op so the model moves on instead of
+                # burning turns on re-reads and re-patches.
+                from tools.fuzzy_match import is_already_applied
+                if is_already_applied(content, old_string, new_string):
+                    return PatchResult(
+                        success=True,
+                        no_change=True,
+                        note=(
+                            f"File already contains the target text — the edit "
+                            f"appears to be already applied to {path}. No write "
+                            "performed; do not re-send this patch."
+                        ),
+                    )
+                err_msg = error or f"Could not find match for old_string in {path}"
+                try:
+                    from tools.fuzzy_match import format_no_match_hint
+                    err_msg += format_no_match_hint(err_msg, match_count, old_string, content)
+                except Exception:
+                    pass
+                return PatchResult(error=err_msg)
+
+            # ── Line-ending preservation ──────────────────────────────────
+            # Models nearly always send old_string/new_string with bare LF
+            # in tool args (JSON-encoded), but the file may have CRLF on
+            # disk.  After fuzzy_find_and_replace, ``new_content`` is a
+            # mixed-ending string: the substituted region is LF, surrounding
+            # text keeps the file's CRLF.  Normalize the whole thing to the
+            # file's detected line ending so the on-disk file is consistent
+            # and the unified diff below reflects the actual change.
+            file_ending = _detect_line_ending(content)
+            if file_ending:
+                new_content = _normalize_line_endings(new_content, file_ending)
+
+            # Write back — pass pre_content (original read, with BOM) to avoid
+            # a redundant cat subprocess inside write_file.  Must be the raw
+            # content (before _strip_bom) so write_file can detect/restore BOM.
+            write_result = self.write_file(path, new_content,
+                                           pre_content=raw_content)
+            if write_result.error:
+                return PatchResult(error=f"Failed to write changes: {write_result.error}")
+
+            # Audit journal (spec §5) — patch-class entry.
+            if _wl.outermost:
+                journal_write(
+                    path, "patch", _before_hash, _hash_text(new_content),
+                    locked=_wl.locked,
                 )
-            err_msg = error or f"Could not find match for old_string in {path}"
-            try:
-                from tools.fuzzy_match import format_no_match_hint
-                err_msg += format_no_match_hint(err_msg, match_count, old_string, content)
-            except Exception:
-                pass
-            return PatchResult(error=err_msg)
-
-        # ── Line-ending preservation ──────────────────────────────────
-        # Models nearly always send old_string/new_string with bare LF
-        # in tool args (JSON-encoded), but the file may have CRLF on
-        # disk.  After fuzzy_find_and_replace, ``new_content`` is a
-        # mixed-ending string: the substituted region is LF, surrounding
-        # text keeps the file's CRLF.  Normalize the whole thing to the
-        # file's detected line ending so the on-disk file is consistent
-        # and the unified diff below reflects the actual change.
-        file_ending = _detect_line_ending(content)
-        if file_ending:
-            new_content = _normalize_line_endings(new_content, file_ending)
-
-        # Write back — pass pre_content (original read, with BOM) to avoid
-        # a redundant cat subprocess inside write_file.  Must be the raw
-        # content (before _strip_bom) so write_file can detect/restore BOM.
-        write_result = self.write_file(path, new_content,
-                                       pre_content=raw_content)
-        if write_result.error:
-            return PatchResult(error=f"Failed to write changes: {write_result.error}")
 
         # Post-write verification — re-read the file and confirm the bytes we
         # intended to write actually landed. Catches silent persistence
