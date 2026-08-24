@@ -81,27 +81,18 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# fcntl is Unix-only; on Windows fall back to msvcrt.  Either may be absent,
-# in which case we degrade to "no cross-process lock" (with a loud warning)
-# rather than failing -- same posture as cron/jobs.py.
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - non-Unix
-    fcntl = None
-try:
-    import msvcrt
-except ImportError:  # pragma: no cover - Unix
-    msvcrt = None
-
 # Bounded acquisition: a plain blocking flock has no timeout, and this lock is
 # taken on the write hot path.  If a sibling process wedges while holding the
 # sidecar (hung-but-alive), an unbounded block would freeze every write in the
-# process silently and forever.  Poll LOCK_NB against a deadline and fall
-# through to degraded (unlocked) mode on timeout, with a loud error -- a
-# briefly-torn cross-process write is strictly better than a permanently
-# wedged write path.  (See cron/jobs.py #60703 for the same decision.)
+# process silently and forever.  The shared flock primitive (reused below from
+# hermes_cli.auth._file_lock) polls LOCK_NB against a deadline; on timeout we
+# fall through to degraded (unlocked) mode with a loud error -- a briefly-torn
+# cross-process write is strictly better than a permanently wedged write path.
+# (See cron/jobs.py #60703 for the same decision.)
 _LOCK_TIMEOUT_SECONDS = 30.0
-_LOCK_POLL_INTERVAL = 0.1
+_LOCK_TIMEOUT_MESSAGE = (
+    "Timed out waiting for concurrent-write lock; proceeding unlocked"
+)
 
 
 # ── Identity resolution (best-effort) ───────────────────────────────────────
@@ -210,7 +201,8 @@ class WriteLock:
 
     def __init__(self, abs_path: str):
         self._path = os.path.abspath(abs_path)
-        self._fd = None
+        self._ctx = None
+        self._locked = False
         self._outermost = False
 
     @property
@@ -227,7 +219,7 @@ class WriteLock:
         WITHOUT cross-process serialization.  Callers journal this flag so
         the audit trail can tell "serialized write" from "raced write".
         """
-        return self._fd is not None
+        return self._locked
 
     def __enter__(self) -> "WriteLock":
         held = _held()
@@ -254,86 +246,59 @@ class WriteLock:
 
     def _acquire(self) -> None:
         sp = sidecar_path(self._path)
+        # Reuse the shared flock primitive (hermes_cli.auth._file_lock) rather
+        # than duplicating the LOCK_EX|LOCK_NB poll loop.  A fresh holder is
+        # passed per acquisition: _file_lock's own reentrancy is keyed on
+        # ``holder.depth``, while our per-path reentrancy lives in _held(), so a
+        # nested acquisition of a *different* path still takes a real,
+        # independent flock.  Imported lazily to avoid an import cycle at module
+        # load (auth pulls config / credential_persistence).
+        from hermes_cli.auth import _file_lock
+
+        holder = threading.local()
         try:
-            sp.parent.mkdir(parents=True, exist_ok=True)
-            fd = open(sp, "a+b")
+            self._ctx = _file_lock(
+                sp, holder, _LOCK_TIMEOUT_SECONDS, _LOCK_TIMEOUT_MESSAGE
+            )
+            self._ctx.__enter__()
+            self._locked = True
+        except TimeoutError:
+            logger.error(
+                "Timed out after %.0fs waiting for write lock %s "
+                "(held by another process). Proceeding unlocked.",
+                _LOCK_TIMEOUT_SECONDS, sp,
+            )
+            self._ctx = None
+            self._locked = False
         except OSError as exc:
             logger.warning(
                 "concurrent-write lock unavailable for %s (%s); "
                 "proceeding without cross-process lock",
                 self._path, exc,
             )
-            self._fd = None
-            return
-
-        self._fd = fd
-        if fcntl is not None:
-            deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
-            while True:
-                try:
-                    fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except (OSError, IOError):
-                    if time.monotonic() >= deadline:
-                        logger.error(
-                            "Timed out after %.0fs waiting for write lock %s "
-                            "(held by another process). Proceeding unlocked.",
-                            _LOCK_TIMEOUT_SECONDS, sp,
-                        )
-                        self._close_fd(fd)
-                        self._fd = None
-                        return
-                    time.sleep(_LOCK_POLL_INTERVAL)
-        elif msvcrt is not None:  # pragma: no cover - Windows
-            try:
-                getattr(msvcrt, "locking")(
-                    fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1
-                )
-            except OSError as exc:
-                logger.warning(
-                    "concurrent-write lock unavailable for %s (%s); "
-                    "proceeding without cross-process lock",
-                    self._path, exc,
-                )
-                self._close_fd(fd)
-                self._fd = None
-                return
-        else:
-            logger.debug(
-                "no flock/msvcrt available; in-process-only write locking"
-            )
+            self._ctx = None
+            self._locked = False
 
         # Record the mtime lease (advisory, see module docstring sec. 3).
-        try:
-            os.utime(sp, None)
-        except OSError:
-            pass
+        # Only touched on a *successful* acquisition — an unlocked (fail-open)
+        # writer has no lease to record.
+        if self._locked:
+            try:
+                os.utime(sp, None)
+            except OSError:
+                pass
 
     def _release(self) -> None:
-        fd = self._fd
-        self._fd = None
-        if fd is None:
+        ctx = self._ctx
+        self._ctx = None
+        if ctx is None:
             return
         try:
-            if fcntl is not None:
-                fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-            elif msvcrt is not None:  # pragma: no cover - Windows
-                getattr(msvcrt, "locking")(
-                    fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1
-                )
-        except (OSError, IOError):
-            pass
-        finally:
-            self._close_fd(fd)
-
-    @staticmethod
-    def _close_fd(fd) -> None:
-        if fd is None:
-            return
-        try:
-            fd.close()
-        except (OSError, AttributeError):
-            pass
+            ctx.__exit__(None, None, None)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug(
+                "error releasing concurrent-write lock for %s", self._path
+            )
 
 
 # ── Journal ─────────────────────────────────────────────────────────────────
