@@ -42,7 +42,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, cast
 
 try:
     from aiohttp import web
@@ -631,6 +631,20 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return "default"
 
+    def _resolve_bare_path_profile(self) -> str:
+        """Resolve a bare-path request (no ``/p/<profile>/`` prefix) to a concrete profile.
+
+        A single-profile gateway resolves to its serving profile
+        (``get_active_profile_name() or "default"``). A multiplexed gateway has
+        no single serving identity, so a bare path is ambiguous and keeps the
+        pre-fix ``"default"`` resolution rather than guessing an arbitrary
+        active profile.
+        """
+        cfg = getattr(self.gateway_runner, "config", None)
+        if getattr(cfg, "multiplex_profiles", False):
+            return "default"
+        return self._serving_profile_name()
+
     @staticmethod
     def _route_allows_profile(
         route_config: dict,
@@ -677,6 +691,12 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response(
                 {"error": "Unknown or unconfigured profile"}, status=404
             )
+        if profile is None:
+            # Bare path: resolve to a concrete profile once — the serving profile
+            # on a single-profile gateway, "default" on a multiplexed one.
+            profile = self._resolve_bare_path_profile()
+        # _PROFILE_REJECTED returned above and None was resolved, so profile is str.
+        profile = cast(str, profile)
 
         if not route_config:
             return web.json_response(
@@ -684,13 +704,10 @@ class WebhookAdapter(BasePlatformAdapter):
             )
 
         if not self._route_allows_profile(route_config, profile):
-            effective_profile = (
-                profile if profile is not None else self._serving_profile_name()
-            )
             logger.warning(
                 "[webhook] Route %s is not authorized for profile %r",
                 route_name,
-                effective_profile,
+                profile,
             )
             # Match the unknown-route response so callers cannot use profile
             # mismatches to enumerate route bindings.

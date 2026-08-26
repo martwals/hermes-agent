@@ -1080,3 +1080,24 @@ def test_serving_profile_name_resolution(monkeypatch):
         "hermes_cli.profiles.get_active_profile_name", _boom
     )
     assert WebhookAdapter._serving_profile_name() == "default"
+
+
+def test_bare_path_profile_resolution_is_multiplex_aware(monkeypatch):
+    # A bare-path request resolves to the serving profile on a single-profile
+    # gateway, but to "default" on a multiplexed gateway — a multiplexed gateway
+    # has no single serving identity, and guessing the active profile would
+    # route a bare path to an arbitrary profile.
+    adapter = _make_adapter()
+
+    # Single-profile: resolves to the serving profile.
+    runner = MagicMock()
+    runner.config.multiplex_profiles = False
+    adapter.gateway_runner = runner
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "boole"
+    )
+    assert adapter._resolve_bare_path_profile() == "boole"
+
+    # Multiplexed: a bare path is ambiguous, so keep the pre-fix "default".
+    runner.config.multiplex_profiles = True
+    assert adapter._resolve_bare_path_profile() == "default"
