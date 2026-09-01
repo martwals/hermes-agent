@@ -472,6 +472,33 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     return global_disabled
 
 
+def get_compact_skill_index() -> bool:
+    """Read ``skills.compact_index`` from config.yaml (default False).
+
+    When True, the system-prompt skill index is compacted to names-only:
+    every skill name stays visible and loadable via ``skill_view`` /
+    ``skills_list``, but descriptions are dropped to cut per-turn token
+    overhead. This is the runtime half of progressive disclosure (the
+    retrieval half is the ``pre_llm_call`` skill-retrieval plugin, which
+    gates its injection on this same flag).
+
+    Reads the config file directly (no CLI imports) to stay lightweight,
+    mirroring :func:`get_disabled_skill_names`.
+    """
+    parsed = _load_raw_config()
+    if not parsed:
+        return False
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return False
+    raw = skills_cfg.get("compact_index")
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "always"}
+
+
 def parse_config_string_list(value) -> List[str]:
     """Normalize a config value that may hold a JSON-array string into a list.
 

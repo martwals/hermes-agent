@@ -1,0 +1,9 @@
+name: skill-retrieval
+version: 0.1.0
+description: "BM25 progressive disclosure: injects top-K relevant skill descriptions per turn via pre_llm_call; pair with skills.compact_index to compact the system-prompt index to names-only."
+author: Dennis Devenv
+license: MIT
+provides_hooks:
+  - pre_llm_call
+pip_dependencies:
+  - pyyaml

@@ -1752,6 +1752,12 @@ def _build_snapshot_entry(
 # Skills index
 # =========================================================================
 
+# Sentinel value for ``compact_categories`` meaning "compact every category".
+# The ``skills.compact_index`` config flag passes this to demote the whole
+# index to names-only regardless of the coding posture.
+COMPACT_ALL_CATEGORIES = "*"
+
+
 def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
     """Read a SKILL.md once and return platform compatibility, frontmatter, and description.
 
@@ -1865,6 +1871,17 @@ def build_skills_system_prompt(
         skills_dir = get_skills_dir()
         _home_token = None
     try:
+        # Progressive disclosure (FR-4): ``skills.compact_index`` demotes the
+        # whole index to names-only. Read here, after the home override is
+        # bound, so the flag resolves from the profile whose skills we index.
+        # Fail-safe: any error leaves the index uncompacted.
+        if compact_categories is None:
+            try:
+                from agent.skill_utils import get_compact_skill_index
+                if get_compact_skill_index():
+                    compact_categories = frozenset({COMPACT_ALL_CATEGORIES})
+            except Exception:
+                compact_categories = None
         external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
         # Trusted project-local dirs (./.hermes/skills, ./.agents/skills at
         # the git root) — highest-precedence tier, scanned before local.
@@ -2128,17 +2145,20 @@ def _build_skills_system_prompt_inner(
     # what the index stops showing them. Match on the top-level category
     # segment so nested categories ("social-media/twitter") are demoted with
     # their parent.
+    _compact_cats = compact_categories or frozenset()
     demoted = frozenset(
-        cat for cat in skills_by_category
-        if cat.split("/", 1)[0] in (compact_categories or frozenset())
+        cat
+        for cat in skills_by_category
+        if COMPACT_ALL_CATEGORIES in _compact_cats
+        or cat.split("/", 1)[0] in _compact_cats
     )
 
     hidden_note = ""
     if demoted:
         hidden_note = (
-            "\n(Categories marked [names only] are outside the current coding "
-            "context, so their descriptions are omitted — the skills work "
-            "normally and load with skill_view(name) as usual.)"
+            "\n(Categories marked [names only] have their descriptions omitted "
+            "to cut token overhead — the skills work normally and load with "
+            "skill_view(name) as usual.)"
         )
 
     if not skills_by_category:
