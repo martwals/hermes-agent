@@ -24,6 +24,7 @@ from pathlib import Path
 
 from tools.binary_extensions import has_binary_extension
 from agent.file_safety import get_write_denied_error
+from tools.concurrent_write_lock import WriteLock, journal_write, _hash_text
 from tools.file_operations_common import (
     ExecuteResult, PatchResult, ReadResult, SearchResult, WriteResult,
     _UTF8_BOM, _detect_line_ending, _has_bom, _normalize_line_endings, _strip_bom,
@@ -1467,6 +1468,11 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         stdin: no ARG_MAX limit) → sha256 verification → lint delta → LSP
         diagnostics when syntax is clean. ``pre_content``: pre-edit content the
         caller already has (skips the read); BOM detection always probes disk.
+
+        Overwrite-class: holds a cross-process flock across the write+verify so a
+        concurrent writer cannot silently clobber this write.  The ``locked`` flag
+        records whether the cross-process fence was actually held (degraded mode
+        falls through without crashing).
         """
         path = self._expand_path(path)
         denied = get_write_denied_error(path)
@@ -1490,21 +1496,42 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             content = _normalize_line_endings(content, "\r\n")
         if has_bom and not _has_bom(content):
             content = _UTF8_BOM + content
-        # Best-effort snapshot so the LSP tier reports only this edit's diagnostics.
-        self._snapshot_lsp_baseline(path)
-        # ``dirs_created`` means "parent dirs ensured" (mkdir -p is folded into
-        # _atomic_write; its failure surfaces as the atomic-write error below).
-        dirs_created = bool(os.path.dirname(path))
+
         # surrogateescape is the exact inverse of the decode that may have produced
         # this content, so these are the bytes on disk; the early rejection above
         # guarantees this cannot raise.
         content_bytes = content.encode("utf-8", "surrogateescape")
-        write_result = self._atomic_write(path, content)
-        if write_result.exit_code != 0:
-            return WriteResult(error=f"Failed to write file: {write_result.stdout}")
-        content_verified, verify_error = self._verify_written_hash(path, content_bytes)
-        if verify_error is not None:
-            return verify_error
+
+        with WriteLock(path) as _wl:
+            # Best-effort snapshot so the LSP tier reports only this edit's diagnostics.
+            self._snapshot_lsp_baseline(path)
+            # ``dirs_created`` means "parent dirs ensured" (mkdir -p is folded into
+            # _atomic_write; its failure surfaces as the atomic-write error below).
+            dirs_created = bool(os.path.dirname(path))
+            # Audit journal (spec §5) — capture the before-hash FIRST, under the
+            # lock and before the write, reading the CURRENT on-disk content (not
+            # ``pre_content``, which is only populated for lint/LSP-covered
+            # extensions and would wrongly record ``null`` for a plain file).
+            _before_hash: Optional[str] = None
+            if _wl.outermost:
+                _before_data, _ = self._read_exact_bytes(path)
+                if _before_data is not None:
+                    _before_hash = _hash_text(_before_data.decode("utf-8", "surrogateescape"))
+            write_result = self._atomic_write(path, content)
+            if write_result.exit_code != 0:
+                return WriteResult(error=f"Failed to write file: {write_result.stdout}")
+            content_verified, verify_error = self._verify_written_hash(path, content_bytes)
+            if verify_error is not None:
+                return verify_error
+            # Overwrite-class entry, only at outermost level (patch_replace calls
+            # write_file from inside its own lock, so the nested acquisition is a
+            # no-op and must not double-journal).
+            if _wl.outermost:
+                journal_write(
+                    path, "overwrite", _before_hash,
+                    _hash_text(content),
+                    locked=_wl.locked,
+                )
 
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
         # LSP diagnostics are a separate channel, fired only when the syntax tier is
@@ -1564,37 +1591,55 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
     def patch_replace(self, path: str, old_string: str, new_string: str,
                       replace_all: bool = False) -> PatchResult:
         """Replace text in a file using fuzzy matching (``old_string`` must be
-        unique unless ``replace_all``). Returns a PatchResult with diff + lint."""
+        unique unless ``replace_all``). Returns a PatchResult with diff + lint.
+
+        Patch-class: holds a cross-process flock across the full read→modify→write
+        critical section, so a concurrent writer cannot clobber the edit.  A
+        fuzzy-match miss inside the lock is a *safe* failure.
+        """
         path = self._expand_path(path)
         denied = get_write_denied_error(path)
         if denied:
             return PatchResult(error=denied)
-        data, failed = self._read_exact_bytes(path)
-        if data is None:
-            return PatchResult(error=failed.cwd_error or f"Failed to read file: {path}")
-        # Every line the replacement does not touch is written back, so read the exact bytes;
-        # surrogateescape lets write_file restore any byte UTF-8 cannot decode (#79178).
-        # Match and diff on BOM-stripped content (a phantom U+FEFF defeats an exact
-        # first-line match); the raw read becomes write_file's pre_content.
-        raw_content = data.decode("utf-8", "surrogateescape")
-        content, _ = _strip_bom(raw_content)
 
-        from tools.fuzzy_match import fuzzy_find_and_replace
-        new_content, match_count, _strategy, error = fuzzy_find_and_replace(
-            content, old_string, new_string, replace_all)
-        if error or match_count == 0:
-            return self._no_match_result(path, content, old_string, new_string, match_count, error)
-        # Models send bare-LF old/new strings; normalize the substituted region to
-        # the file's ending so CRLF files stay consistent.
-        file_ending = _detect_line_ending(content)
-        if file_ending:
-            new_content = _normalize_line_endings(new_content, file_ending)
-        write_result = self.write_file(path, new_content, pre_content=raw_content)
-        if write_result.error:
-            return PatchResult(error=f"Failed to write changes: {write_result.error}")
-        verify_error = self._verify_patch_persisted(path, new_content)
-        if verify_error is not None:
-            return verify_error
+        with WriteLock(path) as _wl:
+            data, failed = self._read_exact_bytes(path)
+            if data is None:
+                return PatchResult(error=failed.cwd_error or f"Failed to read file: {path}")
+            # Every line the replacement does not touch is written back, so read the exact bytes;
+            # surrogateescape lets write_file restore any byte UTF-8 cannot decode (#79178).
+            # Match and diff on BOM-stripped content (a phantom U+FEFF defeats an exact
+            # first-line match); the raw read becomes write_file's pre_content.
+            raw_content = data.decode("utf-8", "surrogateescape")
+            content, _ = _strip_bom(raw_content)
+
+            from tools.fuzzy_match import fuzzy_find_and_replace
+            new_content, match_count, _strategy, error = fuzzy_find_and_replace(
+                content, old_string, new_string, replace_all)
+            if error or match_count == 0:
+                return self._no_match_result(path, content, old_string, new_string, match_count, error)
+            # Models send bare-LF old/new strings; normalize the substituted region to
+            # the file's ending so CRLF files stay consistent.
+            file_ending = _detect_line_ending(content)
+            if file_ending:
+                new_content = _normalize_line_endings(new_content, file_ending)
+
+            write_result = self.write_file(path, new_content, pre_content=raw_content)
+            if write_result.error:
+                return PatchResult(error=f"Failed to write changes: {write_result.error}")
+            verify_error = self._verify_patch_persisted(path, new_content)
+            if verify_error is not None:
+                return verify_error
+            # Audit journal (spec §5) — patch-class entry, only at outermost
+            # level. write_file's inner journal is suppressed (outermost=False
+            # when called from patch_replace), so we handle it here.
+            if _wl.outermost:
+                journal_write(
+                    path, "patch", _hash_text(content),
+                    _hash_text(new_content),
+                    locked=_wl.locked,
+                )
+
         lint_result = self._check_lint_delta(path, pre_content=content, post_content=new_content)
         return PatchResult(
             success=True, diff=self._unified_diff(content, new_content, path), files_modified=[path],

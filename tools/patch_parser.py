@@ -15,6 +15,7 @@ if TYPE_CHECKING:  # annotations only; the real import is per-call in apply_v4a_
     from tools.file_operations_common import PatchResult
 
 from tools.file_operations_common import PatchResult
+from tools.concurrent_write_lock import WriteLock, journal_write, _hash_text
 
 
 class OperationType(Enum):
@@ -347,18 +348,35 @@ def _apply_add(op: PatchOperation, file_ops: Any) -> ApplyResult:
     """Create a file from the hunks' '+' lines. Fails closed when the target already
     exists: validation confirmed the path was free (or freed by an earlier DELETE in
     this patch, which has already applied by now), so an existing file here is a
-    validate/apply race — never clobber."""
-    read_back = file_ops.read_file_raw(op.file_path)
-    if not read_back.error:
-        return _fail(f"{op.file_path}: file already exists — use Update File, not Add File")
-    if not getattr(read_back, "not_found", False):
-        # The read FAILED; it did not report an absent path. Treating that as "the path is free"
-        # writes the Add payload over whatever is actually there.
-        return _fail(f"{op.file_path}: could not confirm the path is free — {read_back.error}")
-    content_lines = [line.content for hunk in op.hunks for line in hunk.lines if line.prefix == '+']
-    result = file_ops.write_file(op.file_path, '\n'.join(content_lines))
-    diff = f"--- /dev/null\n+++ b/{op.file_path}\n" + '\n'.join(f"+{line}" for line in content_lines)
-    return _written(result, diff)
+    validate/apply race — never clobber.
+
+    The existence check and the write both run under one cross-process lock on the
+    resolved path, so two concurrent Adds for the same new path cannot both pass the
+    free-check and have the second silently clobber the first (the check-then-create
+    is atomic).  ``write_file``'s inner lock is a re-entrant no-op; we journal here.
+    """
+    _expand = getattr(file_ops, "_expand_path", None)
+    resolved_path = _expand(op.file_path) if _expand is not None else op.file_path
+    with WriteLock(resolved_path) as _wl:
+        read_back = file_ops.read_file_raw(resolved_path)
+        if not read_back.error:
+            return _fail(f"{op.file_path}: file already exists — use Update File, not Add File")
+        if not getattr(read_back, "not_found", False):
+            # The read FAILED; it did not report an absent path. Treating that as "the path is free"
+            # writes the Add payload over whatever is actually there.
+            return _fail(f"{op.file_path}: could not confirm the path is free — {read_back.error}")
+        content_lines = [line.content for hunk in op.hunks for line in hunk.lines if line.prefix == '+']
+        content = '\n'.join(content_lines)
+        result = file_ops.write_file(resolved_path, content)
+        diff = f"--- /dev/null\n+++ b/{op.file_path}\n" + '\n'.join(f"+{line}" for line in content_lines)
+        # Audit journal (spec §5) — overwrite-class entry, only at outermost (the
+        # inner write_file journal is suppressed by the re-entrant lock).
+        if _wl.outermost and not result.error:
+            journal_write(
+                resolved_path, "overwrite", None, _hash_text(content),
+                locked=_wl.locked,
+            )
+        return _written(result, diff)
 
 
 def _apply_delete(op: PatchOperation, file_ops: Any) -> ApplyResult:
@@ -401,46 +419,69 @@ def _insert_addition_only(new_content: str, hunk: Hunk, insert_text: str) -> Tup
 
 
 def _apply_update(op: PatchOperation, file_ops: Any) -> ApplyResult:
-    """Apply each hunk via fuzzy replace, then write once."""
+    """Apply each hunk via fuzzy replace, then write once.
+
+    Patch-class: cross-process flock spans read → modify → write, so a
+    concurrent writer cannot clobber the edit.  A fuzzy-match miss inside
+    the lock is a safe failure.
+    """
     from tools.fuzzy_match import fuzzy_find_and_replace, is_already_applied
-    read_result = file_ops.read_file_raw(op.file_path)  # raw: no line numbers / truncation
-    if read_result.error:
-        return _fail(f"Cannot read file: {read_result.error}")
-    current_content = new_content = read_result.content
-    for hunk in op.hunks:
-        search_lines, replace_lines = _split_hunk(hunk)
-        if search_lines and search_lines == replace_lines:
-            continue
-        search_pattern, replacement = '\n'.join(search_lines), '\n'.join(replace_lines)
-        if not search_lines:
-            new_content, err = _insert_addition_only(new_content, hunk, replacement)
-            if err:
-                return _fail(err)
-            continue
-        new_content, count, _strategy, error = fuzzy_find_and_replace(
-            new_content, search_pattern, replacement, replace_all=False)
-        if not (error and count == 0):
-            continue
-        # Retry inside a window around the context hint, if any.
-        hint_pos = new_content.find(hunk.context_hint) if hunk.context_hint else -1
-        if hint_pos != -1:
-            window_start = max(0, hint_pos - 500)
-            window_end = min(len(new_content), hint_pos + 2000)
-            window_new, count, _strategy, error = fuzzy_find_and_replace(
-                new_content[window_start:window_end], search_pattern, replacement, replace_all=False)
-            if count > 0:
-                new_content = new_content[:window_start] + window_new + new_content[window_end:]
-                error = None
-        if error:
-            # Mirror validation's already-applied skip, else the two phases disagree and fail here.
-            if is_already_applied(new_content, search_pattern, replacement):
+    # Expand ``~`` with the SAME normalization write_file applies internally, so
+    # the outer lock here and the nested write_file lock hash to the SAME sidecar
+    # (a divergent path would defeat re-entrancy and double-journal).
+    _expand = getattr(file_ops, "_expand_path", None)
+    resolved_path = _expand(op.file_path) if _expand is not None else op.file_path
+    with WriteLock(resolved_path) as _wl:
+        read_result = file_ops.read_file_raw(resolved_path)  # raw: no line numbers / truncation
+        if read_result.error:
+            return _fail(f"Cannot read file: {read_result.error}")
+        current_content = new_content = read_result.content
+        for hunk in op.hunks:
+            search_lines, replace_lines = _split_hunk(hunk)
+            if search_lines and search_lines == replace_lines:
                 continue
-            hint = _no_match_hint(error, search_pattern, new_content)
-            return _fail(f"Could not apply hunk: {error}" + hint)
-    # Pass pre_content to skip a redundant re-read inside write_file when supported.
-    extra = {"pre_content": current_content} if _write_file_accepts_pre_content(file_ops) else {}
-    write_result = file_ops.write_file(op.file_path, new_content, **extra)
-    return _written(write_result, _unified_diff(op.file_path, current_content, new_content))
+            search_pattern, replacement = '\n'.join(search_lines), '\n'.join(replace_lines)
+            if not search_lines:
+                new_content, err = _insert_addition_only(new_content, hunk, replacement)
+                if err:
+                    return _fail(err)
+                continue
+            new_content, count, _strategy, error = fuzzy_find_and_replace(
+                new_content, search_pattern, replacement, replace_all=False)
+            if not (error and count == 0):
+                continue
+            # Retry inside a window around the context hint, if any.
+            hint_pos = new_content.find(hunk.context_hint) if hunk.context_hint else -1
+            if hint_pos != -1:
+                window_start = max(0, hint_pos - 500)
+                window_end = min(len(new_content), hint_pos + 2000)
+                window_new, count, _strategy, error = fuzzy_find_and_replace(
+                    new_content[window_start:window_end], search_pattern, replacement, replace_all=False)
+                if count > 0:
+                    new_content = new_content[:window_start] + window_new + new_content[window_end:]
+                    error = None
+            if error:
+                # Mirror validation's already-applied skip, else the two phases disagree and fail here.
+                if is_already_applied(new_content, search_pattern, replacement):
+                    continue
+                hint = _no_match_hint(error, search_pattern, new_content)
+                return _fail(f"Could not apply hunk: {error}" + hint)
+        # Pass pre_content to skip a redundant re-read inside write_file when supported.
+        extra = {"pre_content": current_content} if _write_file_accepts_pre_content(file_ops) else {}
+        write_result = file_ops.write_file(resolved_path, new_content, **extra)
+        if write_result.error:
+            return _written(write_result, _unified_diff(op.file_path, current_content, new_content))
+        # Audit journal (spec §5) — patch-class entry, only at outermost, and only
+        # after a successful write+verify (a failed-persistence write is never
+        # recorded as a clean after-hash).
+        if _wl.outermost:
+            journal_write(
+                resolved_path, "patch",
+                _hash_text(current_content),
+                _hash_text(new_content),
+                locked=_wl.locked,
+            )
+        return _written(write_result, _unified_diff(op.file_path, current_content, new_content))
 
 
 # operation -> (handler, verb for error text, files_* bucket)

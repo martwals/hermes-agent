@@ -22,6 +22,7 @@ import hermes_yaml as yaml
 
 from hermes_constants import get_hermes_home
 from utils import atomic_write_text, is_truthy_value
+from tools.concurrent_write_lock import WriteLock, journal_write, _hash_text
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
     extract_skill_description,
@@ -350,23 +351,43 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
 def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label: str,
                    content: str) -> Optional[Dict[str, Any]]:
     """Read-before-write guard (existing targets only), atomic write, then the security scan;
-    a blocked scan restores the original (or unlinks a new file). Error dict or None."""
-    original = None
-    if target.exists():
-        if read_guard := _background_review_read_before_write_guard(name, target, action, label):
-            return read_guard
-        original = target.read_text(encoding="utf-8-sig")
-    from hermes_constants import mkdir_under_hermes_home
-    mkdir_under_hermes_home(target.parent)
-    atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
-    scan_error = _security_scan_skill(skill_dir)
-    if not scan_error:
-        return None
-    if original is not None:
-        atomic_write_text(target, original, preserve_mode=True)
-    else:
-        target.unlink(missing_ok=True)
-    return _err(scan_error)
+    a blocked scan restores the original (or unlinks a new file). Error dict or None.
+
+    Overwrite-class: the write + scan + rollback all run under a cross-process
+    ``WriteLock`` on ``target`` so a concurrent writer cannot clobber this write
+    or race the rollback.  The journal records the write (and a blocked-scan
+    rollback) only at the outermost lock level — ``_patch_skill`` holds the outer
+    patch-class lock and journals itself, so its nested call here stays silent.
+    """
+    with WriteLock(str(target)) as _wl:
+        original = None
+        if target.exists():
+            if read_guard := _background_review_read_before_write_guard(name, target, action, label):
+                return read_guard
+            original = target.read_text(encoding="utf-8-sig")
+        from hermes_constants import mkdir_under_hermes_home
+        mkdir_under_hermes_home(target.parent)
+        _before_hash = _hash_text(original)
+        atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
+        _after_hash = _hash_text(content)
+        scan_error = _security_scan_skill(skill_dir)
+        if not scan_error:
+            if _wl.outermost:
+                journal_write(
+                    str(target), "overwrite", _before_hash, _after_hash,
+                    locked=_wl.locked,
+                )
+            return None
+        if original is not None:
+            atomic_write_text(target, original, preserve_mode=True)
+            if _wl.outermost:
+                journal_write(
+                    str(target), "overwrite", _after_hash, _before_hash,
+                    locked=_wl.locked,
+                )
+        else:
+            target.unlink(missing_ok=True)
+        return _err(scan_error)
 
 
 def _attach_org_note(result: Dict[str, Any], name: str, skill_dir: Path) -> Dict[str, Any]:
@@ -490,23 +511,34 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = N
         return _err(f"File not found: {target.relative_to(skill_dir)}")
     if read_guard := _background_review_read_before_write_guard(name, target, "patch", target_label):
         return read_guard
-    content = target.read_text(encoding="utf-8-sig")
 
-    # Use the same fuzzy matching engine as the file patch tool.
-    from tools.fuzzy_match import fuzzy_find_and_replace
-    new_content, match_count, _strategy, match_error = fuzzy_find_and_replace(
-        content, old_string, new_string, replace_all)
-    if match_error:
-        with suppress(Exception):
-            from tools.fuzzy_match import format_no_match_hint
-            match_error += format_no_match_hint(match_error, match_count, old_string, content)
-        return _err(match_error) | {"file_preview": _clip(content, 500, "...")}
-    if err := _validate_content_size(new_content, label=target_label):
-        return _err(err)
-    if not file_path and (err := _validate_frontmatter(new_content)):
-        return _err(f"Patch would break SKILL.md structure: {err}")
-    if guard := _guarded_write(name, skill_dir, target, "patch", target_label, new_content):
-        return guard
+    # Patch-class: the flock spans the read → fuzzy-match → write cycle so a
+    # concurrent writer can't interleave between our read and our write.  The
+    # inner _guarded_write lock is a re-entrant no-op; we journal here at the
+    # outermost level.
+    with WriteLock(str(target)) as _wl:
+        content = target.read_text(encoding="utf-8-sig")
+
+        # Use the same fuzzy matching engine as the file patch tool.
+        from tools.fuzzy_match import fuzzy_find_and_replace
+        new_content, match_count, _strategy, match_error = fuzzy_find_and_replace(
+            content, old_string, new_string, replace_all)
+        if match_error:
+            with suppress(Exception):
+                from tools.fuzzy_match import format_no_match_hint
+                match_error += format_no_match_hint(match_error, match_count, old_string, content)
+            return _err(match_error) | {"file_preview": _clip(content, 500, "...")}
+        if err := _validate_content_size(new_content, label=target_label):
+            return _err(err)
+        if not file_path and (err := _validate_frontmatter(new_content)):
+            return _err(f"Patch would break SKILL.md structure: {err}")
+        if guard := _guarded_write(name, skill_dir, target, "patch", target_label, new_content):
+            return guard
+        if _wl.outermost:
+            journal_write(
+                str(target), "patch", _hash_text(content), _hash_text(new_content),
+                locked=_wl.locked,
+            )
     result = {
         "success": True,
         "message": f"Patched {target_label} in skill '{name}' ({match_count} replacement{'s' if match_count > 1 else ''}).",
