@@ -587,8 +587,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if payload is _UNPARSEABLE:
             return _json_error("Cannot parse body", 400)
         headers = request.headers
+        _pd = self._safe_payload(payload)  # dict form for metadata extraction
         event_type = (headers.get("X-GitHub-Event", "") or headers.get("X-GitLab-Event", "")
-                      or payload.get("event_type", "") or payload.get("type", "") or "unknown")
+                      or _pd.get("event_type", "") or _pd.get("type", "") or "unknown")
         allowed_events = route_config.get("events", [])
         if allowed_events and event_type not in allowed_events:
             logger.debug("[webhook] Ignoring event %s for route %s (allowed: %s)", event_type, route_name,
@@ -756,6 +757,22 @@ class WebhookAdapter(BasePlatformAdapter):
         return False
 
     # --- Prompt rendering ---
+
+    @staticmethod
+    def _safe_payload(payload: Any) -> dict:
+        """Return the payload as a dict for metadata extraction.
+
+        Handles Alertmanager-style array payloads (vmalert, VictoriaMetrics) by
+        returning the first element; falls back to ``{}`` for non-dict / empty
+        inputs.  The original (possibly a list) is always preserved and passed
+        through to coalesce / dispatch paths so the full payload reaches the agent.
+        """
+        if isinstance(payload, dict):
+            return payload
+        if isinstance(payload, list) and payload:
+            first = payload[0]
+            return first if isinstance(first, dict) else {}
+        return {}
 
     def _render_prompt(self, template: str, payload: dict, event_type: str, route_name: str) -> str:
         """Render a prompt template with dot-notation payload access (``{pull_request.title}``);
