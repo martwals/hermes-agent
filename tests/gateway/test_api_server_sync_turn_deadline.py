@@ -12,6 +12,7 @@ Rows T1-T9 of the design's test plan. What each one is FOR:
 """
 
 import asyncio
+import json
 import time
 from unittest.mock import patch
 
@@ -305,3 +306,124 @@ class TestStreamingKeepalive:
 
         assert response.status == 200
         assert ": keepalive" in text
+
+
+# ---------------------------------------------------------------------------
+# T10-T13 — review findings: settlement ownership, unknown outcomes, encoding
+# ---------------------------------------------------------------------------
+
+
+def _only_claim_row(adapter):
+    rows = adapter._run_idempotency_store._conn.execute(
+        "SELECT scope, idempotency_key, fingerprint, run_id, status_json, owner_pid "
+        "FROM run_idempotency").fetchall()
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+class TestReviewDisposition:
+    @pytest.mark.asyncio
+    async def test_cancelled_request_still_settles_the_claim(self):
+        """Finding 1: a request cancelled before the deadline must not strand the claim row."""
+        import contextlib
+
+        adapter = _make_adapter(deadline=30)
+        store = adapter._run_idempotency_store
+        claim = {"id": "sync_cancel_row", "scope": "sc", "key": "k", "session_id": SESSION,
+                 "route": "chat_completions"}
+        store.reserve("sc", "k", "fp", claim["id"],
+                      {"status": "running", "session_id": SESSION, "route": "chat_completions"},
+                      owner_pid=0, owner_started=0)
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def compute():
+            started.set()
+            await release.wait()
+            return _reply("cancelled but finished")
+
+        running = asyncio.create_task(adapter._run_sync_turn_under_deadline(
+            compute, session_id=SESSION, claim=claim, log_label="t10"))
+        await started.wait()
+        running.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await running
+        release.set()
+        row = None
+        for _ in range(200):
+            row = _only_claim_row(adapter)
+            if "running" not in row[4]:
+                break
+            await asyncio.sleep(0.01)
+
+        assert '"completed"' in row[4], row[4]
+
+    @pytest.mark.asyncio
+    async def test_dead_owner_claim_reports_unknown_not_completed(self):
+        """Finding 2: an owner that died mid-turn must not be reported as a finished turn."""
+        adapter = _make_adapter(deadline=0)
+        turn = _SlowTurn()
+        turn.release.set()
+        headers = {**AUTH, "Idempotency-Key": "sup53-dead-owner"}
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            with patch.object(adapter, "_run_agent", turn):
+                first = await cli.post("/v1/chat/completions",
+                                       json={"messages": [USER_TURN]}, headers=headers)
+                assert first.status == 200
+                scope, key, fingerprint, claim_id, _status, _pid = _only_claim_row(adapter)
+                adapter._run_idempotency_store._conn.execute(
+                    "UPDATE run_idempotency SET status_json=?, owner_pid=?, owner_started=0 "
+                    "WHERE run_id=?",
+                    ('{"status":"running","session_id":"' + SESSION + '"}', 999999, claim_id))
+                adapter._run_idempotency_store._conn.commit()
+                # Drop the in-process replay slot so the DURABLE claim is what answers.
+                api_server_module._idem_cache._store.clear()
+                second = await cli.post("/v1/chat/completions",
+                                        json={"messages": [USER_TURN]}, headers=headers)
+                body = await second.json()
+
+        assert second.status == 409
+        assert body["error"]["code"] == "duplicate_turn_interrupted"
+        assert "NEW Idempotency-Key" in body["error"]["message"]
+        assert '"interrupted"' in _only_claim_row(adapter)[4]
+
+    @pytest.mark.asyncio
+    async def test_late_failed_turn_is_not_counted_as_a_completion(self):
+        """Finding 4: a turn that ends flagged failed is settled failed and not counted."""
+        adapter = _make_adapter(deadline=0.05)
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def compute():
+            started.set()
+            await release.wait()
+            return {"final_response": "", "failed": True, "messages": []}, {"total_tokens": 0}
+
+        claim = {"id": "sync_failed_row", "scope": "sc", "key": "k2", "session_id": SESSION,
+                 "route": "chat_completions"}
+        adapter._run_idempotency_store.reserve("sc", "k2", "fp2", claim["id"],
+                                               {"status": "running", "session_id": SESSION},
+                                               owner_pid=0, owner_started=0)
+        with pytest.raises(Exception):
+            await adapter._run_sync_turn_under_deadline(
+                compute, session_id=SESSION, claim=claim, log_label="t12")
+        release.set()
+        row = None
+        for _ in range(200):
+            row = _only_claim_row(adapter)
+            if "running" not in row[4]:
+                break
+            await asyncio.sleep(0.01)
+
+        assert '"failed"' in row[4], row[4]
+        assert adapter._late_completions_today == 0
+
+    @pytest.mark.asyncio
+    async def test_poll_path_encodes_the_session_id_as_one_segment(self):
+        """Finding 6: an accepted-but-URL-unsafe session id cannot change the poll target."""
+        adapter = _make_adapter(deadline=0)
+        response = adapter._sync_turn_deadline_response("a b?c#d", 840)
+        body = json.loads(response.text)
+
+        assert body["hermes"]["poll"]["path"] == "/api/sessions/a%20b%3Fc%23d/messages"
+

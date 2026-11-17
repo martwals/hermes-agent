@@ -74,6 +74,18 @@ class _SyncTurnDeadlineExceeded(Exception):
         self.deadline_seconds = deadline_seconds
 
 
+def _session_messages_path(session_id: str) -> str:
+    """Poll pointer for a session, with the id percent-encoded as ONE path segment.
+
+    Review finding 6: the id only has to be filesystem-safe, not URL-safe — an accepted id such as
+    ``a?x=1`` would otherwise produce a pointer that targets a different resource.
+    """
+    if not session_id:
+        return ""
+    from urllib.parse import quote
+    return f"/api/sessions/{quote(str(session_id), safe='')}/messages"
+
+
 def _result_flags(result: Any) -> tuple:
     """``(completed, partial, failed, error)`` from an agent result dict (defaults if not a dict)."""
     if not isinstance(result, dict):
@@ -906,15 +918,12 @@ class OpenAICompatRoutesMixin:
                 compute, session_id=session_id, claim=claim, log_label=log_label)
             if scoped_key:
                 _idem_cache.put(scoped_key, fp, result)
-            if claim is not None:
-                self._settle_sync_turn_claim(claim, "completed")
+            # Claim settlement belongs to the turn's own done-callback; the handler never settles.
             return result, None
         except _SyncTurnDeadlineExceeded as late:
             # The turn is detached and still running; its done-callback settles the claim.
             return None, self._sync_turn_deadline_response(late.session_id, late.deadline_seconds)
         except Exception as e:
-            if claim is not None:
-                self._settle_sync_turn_claim(claim, "failed")
             logger.error("Error running agent for %s: %s", log_label, e, exc_info=True)
             message = "" if getattr(e, "_notification_presentation_suppressed", False) is True else f"Internal server error: {e}"
             return None, _error_response(message, 500, err_type="server_error")
@@ -950,6 +959,13 @@ class OpenAICompatRoutesMixin:
             {"object": "hermes.sync_turn", "status": "running", "session_id": session_id, "route": route},
             owner_pid=self._run_owner_pid, owner_started=self._run_owner_started)
         if outcome == "created":
+            if not getattr(self._run_idempotency_store, "durable", True):
+                # Review finding 3: with no on-disk store each worker holds its own memory table, so
+                # this claim cannot stop a duplicate in a sibling process. Refusing keyed work would
+                # turn a degraded disk into an outage, so the degradation is logged once per claim.
+                logger.warning(
+                    "sync idempotency claim for %s is NOT durable (run idempotency store is "
+                    "process-local); a duplicate in another worker will not be refused", route)
             return claim, None
         if outcome == "conflict":
             return None, _error_response(
@@ -957,15 +973,39 @@ class OpenAICompatRoutesMixin:
                 409, code="idempotency_key_conflict")
         stored = (record or {}).get("status") or {}
         recorded_session = str(stored.get("session_id") or session_id or "")
-        if (str(stored.get("status") or "") not in TERMINAL_STATUSES
-                and _owner_alive(int((record or {}).get("owner_pid") or 0),
-                                 int((record or {}).get("owner_started") or 0))):
+        recorded_status = str(stored.get("status") or "")
+        recorded_id = str((record or {}).get("run_id") or "")
+        if recorded_status in TERMINAL_STATUSES:
+            # Only ``completed`` justifies "your answer is over there" (review finding 2): a failed
+            # or interrupted row says nothing about an answer, and claiming otherwise sends the
+            # caller to an empty session.
+            if recorded_status == "completed":
+                return None, self._duplicate_sync_turn_response(
+                    recorded_session, "duplicate_turn_completed",
+                    "An agent turn for this Idempotency-Key already ran; poll its session instead "
+                    "of re-running it.")
+            return None, self._duplicate_sync_turn_response(
+                recorded_session, "duplicate_turn_interrupted",
+                f"The earlier attempt for this Idempotency-Key ended {recorded_status}; its outcome "
+                "is unknown. Poll the session, or re-ask with a NEW Idempotency-Key.")
+        if _owner_alive(int((record or {}).get("owner_pid") or 0),
+                        int((record or {}).get("owner_started") or 0)):
             return None, self._duplicate_sync_turn_response(
                 recorded_session, "duplicate_turn_in_progress",
                 "An agent turn for this Idempotency-Key is still running; it was not duplicated.")
+        # Owner is gone and the claim never reached a terminal status: the first request may have run
+        # or may never have started, and nothing here can tell. Record that verdict so the row cannot
+        # block the key for the whole retention window, and say "unknown", not "completed".
+        try:
+            self._run_idempotency_store.update_status(recorded_id, {
+                "object": "hermes.sync_turn", "status": "interrupted",
+                "session_id": recorded_session, "route": route})
+        except Exception:
+            logger.debug("failed to terminalise abandoned sync claim %s", recorded_id, exc_info=True)
         return None, self._duplicate_sync_turn_response(
-            recorded_session, "duplicate_turn_completed",
-            "An agent turn for this Idempotency-Key already ran; poll its session instead of re-running it.")
+            recorded_session, "duplicate_turn_interrupted",
+            "The earlier attempt for this Idempotency-Key never reported an outcome for this turn. "
+            "Poll the session, or re-ask with a NEW Idempotency-Key.")
 
     def _settle_sync_turn_claim(self, claim: Dict[str, Any], status: str) -> None:
         """Move a durable claim to a terminal status, best-effort (never breaks the response)."""
@@ -984,33 +1024,59 @@ class OpenAICompatRoutesMixin:
         detached task is tracked for shutdown drain and carries the late-completion accounting.
         """
         deadline = float(getattr(self, "_sync_turn_deadline_seconds", 0) or 0)
-        if deadline <= 0:
-            return await compute()
+        timeout = deadline if deadline > 0 else None
         started = time.monotonic()
         task = asyncio.ensure_future(compute())
         self._track_background_task(task)
-        done, _pending = await asyncio.wait({task}, timeout=deadline)
-        if task in done:
-            return task.result()
+        # ONE settlement owner (review findings 1, 4, 5): the callback is installed at task creation,
+        # not on the deadline branch, so a request cancelled by the client or by shutdown drain cannot
+        # strand the claim, and the claim's verdict comes from the turn's own result rather than from
+        # the handler's assumptions. `expired` is flipped by the code below, because only the await
+        # knows whether the caller was released before the turn ended.
+        expired = {"value": False}
 
-        def _on_late(done_task) -> None:
+        def _on_turn_done(done_task) -> None:
             elapsed = time.monotonic() - started
+            status = "failed"
             chars = 0
-            failed = done_task.cancelled()
-            if not failed:
+            if done_task.cancelled():
+                status = "interrupted"
+            else:
                 try:
                     result = done_task.result()
-                    if isinstance(result, tuple) and result and isinstance(result[0], dict):
-                        chars = len(str(result[0].get("final_response") or ""))
                 except Exception as exc:
-                    failed = True
                     logger.warning(
                         "late_completion session_id=%s failed after the deadline: %r", session_id, exc)
-            self._record_late_completion(session_id, elapsed, chars)
+                else:
+                    if isinstance(result, tuple) and result and isinstance(result[0], dict):
+                        chars = len(str(result[0].get("final_response") or ""))
+                        completed, is_partial, is_failed, _err = _result_flags(result[0])
+                        # A turn that returns failed=True did not answer anyone: settle it as failed
+                        # and keep it out of the success counter (review finding 4).
+                        status = "completed" if completed and not (is_failed or is_partial) else "failed"
+                    else:
+                        status = "completed"
+            if expired["value"]:
+                if status == "completed":
+                    self._record_late_completion(session_id, elapsed, chars)
+                else:
+                    logger.warning(
+                        "late_completion session_id=%s ended %s after the deadline (output_chars=%d)",
+                        session_id, status, chars)
             if claim is not None:
-                self._settle_sync_turn_claim(claim, "failed" if failed else "completed")
+                self._settle_sync_turn_claim(claim, status)
 
-        task.add_done_callback(_on_late)
+        task.add_done_callback(_on_turn_done)
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            # The request died (client gone, shutdown drain) but the turn did not: mark it expired so
+            # the callback still accounts for it, and let the cancellation propagate.
+            expired["value"] = True
+            raise
+        if task in done:
+            return task.result()
+        expired["value"] = True
         logger.warning(
             "sync turn exceeded sync_turn_deadline_seconds=%.1fs for %s (session %s); "
             "answering 504 and leaving the turn running",
@@ -1019,13 +1085,13 @@ class OpenAICompatRoutesMixin:
 
     @staticmethod
     def _sync_turn_handoff_payload(session_id: str, **extra) -> Dict[str, Any]:
-        poll_path = f"/api/sessions/{session_id}/messages" if session_id else ""
+        poll_path = _session_messages_path(session_id)
         return {"session_id": session_id, "poll": {"method": "GET", "path": poll_path}, **extra}
 
     def _sync_turn_deadline_response(self, session_id: str, deadline_seconds: int):
         """504 in the API's own JSON envelope, carrying the handle the proxy's HTML never does."""
         from gateway.platforms.api_server import _openai_error
-        poll_path = f"/api/sessions/{session_id}/messages" if session_id else ""
+        poll_path = _session_messages_path(session_id)
         body = _openai_error(
             f"The agent turn is still running after {deadline_seconds}s; it was NOT cancelled. "
             f"Poll GET {poll_path} for its answer instead of retrying — a retry starts a second turn.",
