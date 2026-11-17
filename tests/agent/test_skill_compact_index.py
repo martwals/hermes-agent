@@ -123,7 +123,15 @@ def test_one_named_category_does_not_demote_the_others(monkeypatch, tmp_path):
     partial = build_skills_system_prompt(compact_categories=frozenset({"tools"}))
 
     assert "Search the web" not in partial  # demoted on request
-    assert "Write threads" in partial  # untouched
+    assert "web-search" in partial  # ...and its name still survives the demotion
+    assert "Write threads" in partial  # untouched category keeps its description
+    # The nested category follows its parent, so a category-level list demotes
+    # both "social-media" and "social-media/twitter" — asserted rather than assumed.
+    nested = build_skills_system_prompt(compact_categories=frozenset({"social-media"}))
+    assert "Write threads" not in nested
+    assert "Write hooks" not in nested
+    assert "thread-hook" in nested
+    assert "Search the web" in nested
 
 
 # ---- 3. the flag alone is enough — no caller change --------------------------------------
