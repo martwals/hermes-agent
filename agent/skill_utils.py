@@ -310,6 +310,31 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     return disabled - ESSENTIAL_SKILLS
 
 
+def get_compact_skill_index() -> bool:
+    """Read ``skills.compact_index`` from config.yaml (default False).
+
+    When True, the system-prompt skill index is compacted to names-only: every
+    skill name stays visible and loadable via ``skill_view`` / ``skills_list``,
+    but descriptions are dropped to cut per-turn token overhead. This is the
+    runtime half of progressive disclosure; the retrieval half is the
+    ``pre_llm_call`` skill-retrieval plugin, which gates its injection on this
+    same flag.
+
+    Mirrors :func:`get_disabled_skill_names`: the config is read through
+    ``_skills_cfg()``, and every unreadable shape answers False so a malformed
+    value can never compact the index by accident.
+    """
+    skills_cfg = _skills_cfg()
+    if not skills_cfg:
+        return False
+    raw = skills_cfg.get("compact_index")
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "always"}
+
+
 def parse_config_string_list(value) -> List[str]:
     """Normalize a config value that may hold a JSON-array string into a list.
     ``hermes config set`` stores lists as quoted JSON/Python-literal strings;

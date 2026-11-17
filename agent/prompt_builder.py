@@ -1331,6 +1331,12 @@ def _current_session_platform_hint() -> str:
         return ""
 
 
+# Sentinel value for ``compact_categories`` meaning "compact every category".
+# ``skills.compact_index`` passes this so the whole index is demoted to
+# names-only regardless of the coding posture (SUP-52).
+COMPACT_ALL_CATEGORIES = "*"
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None, available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None, skills_dir_override: "Path | None" = None,
@@ -1348,6 +1354,18 @@ def build_skills_system_prompt(
         _home_token = set_hermes_home_override(str(skills_dir.parent))
     else:
         skills_dir = get_skills_dir()
+    # Progressive disclosure: ``skills.compact_index`` demotes the whole index to
+    # names-only. Read here, after the home/profile override is bound, so the flag
+    # resolves from the profile whose skills are being indexed. Fail-safe: any
+    # error leaves the index uncompacted (SUP-52).
+    if compact_categories is None:
+        try:
+            from agent.skill_utils import get_compact_skill_index
+
+            if get_compact_skill_index():
+                compact_categories = frozenset({COMPACT_ALL_CATEGORIES})
+        except Exception:
+            compact_categories = None
     try:
         external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
         # Trusted project-local dirs — highest-precedence tier; cwd/trust are session-stable, so byte-stable.
@@ -1424,11 +1442,18 @@ def _render_skills_index(
         return ""
     # Demoted categories collapse to one names-only line. NEVER drop entries — agent-created skills are the
     # model's project memory and it won't rediscover them via skills_list. Nested categories follow their parent.
-    demoted = frozenset(cat for cat in skills_by_category if cat.split("/", 1)[0] in (compact_categories or frozenset()))
+    _compact_cats = compact_categories or frozenset()
+    # The ``COMPACT_ALL_CATEGORIES`` sentinel demotes every category; otherwise match on the top-level
+    # segment so nested categories ("social-media/twitter") follow their parent. Without the sentinel
+    # arm a frozenset({"*"}) matches no real category and the flag would compact nothing (SUP-52).
+    demoted = frozenset(
+        cat
+        for cat in skills_by_category
+        if COMPACT_ALL_CATEGORIES in _compact_cats or cat.split("/", 1)[0] in _compact_cats
+    )
     hidden_note = (
-        "\n(Categories marked [names only] are outside the current coding "
-        "context, so their descriptions are omitted — the skills work "
-        "normally and load with skill_view(name) as usual.)"
+        "\n(Categories marked [names only] have their descriptions omitted — "
+        "the skills work normally and load with skill_view(name) as usual.)"
     ) if demoted else ""
     # Don't name web_search when the session has no web tools (dangling reference).
     _basic_tools = "terminal" if available_tools is not None and "web_search" not in available_tools else "web_search or terminal"
