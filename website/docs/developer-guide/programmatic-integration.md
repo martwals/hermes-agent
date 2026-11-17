@@ -183,6 +183,37 @@ Use `/v1/models` for OpenAI-client compatibility. Use `/api/model/options` or
 
 A `200` (and the `run.steered` event) means the text was **queued**, not that the agent consumed it. If a steer lands after the agent's final response — with no later tool boundary to deliver it at — the undelivered text is returned as `pending_steer` on the terminal event (`run.completed`, `run.failed`, or `run.cancelled`) and run status, so the client can replay it as the next user turn instead of losing it.
 
+#### Long turns and the gateway deadline
+
+`POST /v1/chat/completions` and `POST /v1/responses` hold the HTTP connection until the turn
+finishes, so they are for turns that fit inside `gateway.api_server.sync_turn_deadline_seconds`
+(default `840`). Past that deadline the gateway answers **`504` with its own JSON envelope** —
+`error.code: "gateway_timeout"`, `hermes.session_id`, and `hermes.poll` pointing at
+`GET /api/sessions/{id}/messages` — and **the turn keeps running**, so the answer the poll
+returns is the real one. A `504` here is a handoff, not a failure: poll it, never retry it.
+
+Three things make that work, and all three are the deployer's business:
+
+- **The proxy must be slower than the gateway.** `sync_turn_deadline_seconds` has to be strictly
+  less than every `proxy_read_timeout`/`proxy_send_timeout` serving the listener (the reference
+  deployment pairs `840` here with `900s` at the proxy). If the proxy wins the race the caller
+  gets the proxy's HTML error instead, with no session id — the failure mode this deadline exists
+  to remove.
+- **`0` disables the deadline** and restores the pre-deadline behaviour exactly.
+- **Late completions are visible.** Each turn that outlives the deadline and still finishes logs
+  one `late_completion` warning and increments `late_completions_today` on `/health/detailed`
+  (with `last_late_completion_at`). Growth there means the deadline is short for the traffic.
+
+For turns that read files, prefer `POST /v1/runs` (`202` + `run_id`, poll `GET /v1/runs/{id}`):
+it never holds a connection for the length of a turn.
+
+**Duplicate turns.** With an `Idempotency-Key`, a retry cannot buy a second turn: a duplicate
+that arrives while the original is still running is answered `409 duplicate_turn_in_progress`, one
+that arrives after it finished is `409 duplicate_turn_completed`, and the same key with a different
+payload is `409 idempotency_key_conflict` — each carrying `hermes.session_id` and the poll pointer.
+The claim is durable (the same SQLite store `/v1/runs` uses), so it survives a gateway restart, and
+a completed body is additionally replayed from memory for five minutes.
+
 #### Terminal run status
 
 The terminal status of a run is derived from how the agent's turn actually ended, and the terminal event name always matches it (`run.<status>`):

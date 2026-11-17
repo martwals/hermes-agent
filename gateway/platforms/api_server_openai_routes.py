@@ -59,6 +59,21 @@ async def _iter_stream_items(stream_q, agent_task, response):
         last_activity = time.monotonic()
 
 
+class _SyncTurnDeadlineExceeded(Exception):
+    """A synchronous turn outlived ``sync_turn_deadline_seconds`` and is still running.
+
+    SUP-53 / DD-DENNIS-009. Raised *after* the deadline task has been detached and its
+    done-callback installed, so the turn keeps running and its answer still lands in the
+    session transcript while the caller is handed a JSON 504 with the poll pointer.
+    """
+
+    def __init__(self, *, session_id: str, deadline_seconds: int):
+        super().__init__(
+            f"agent turn still running after {deadline_seconds}s (session {session_id or 'unknown'})")
+        self.session_id = session_id
+        self.deadline_seconds = deadline_seconds
+
+
 def _result_flags(result: Any) -> tuple:
     """``(completed, partial, failed, error)`` from an agent result dict (defaults if not a dict)."""
     if not isinstance(result, dict):
@@ -793,6 +808,9 @@ class OpenAICompatRoutesMixin:
             fingerprint_keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream",
                               "hermes_notification_category"],
             route="chat_completions",
+            # SUP-53: the 504/409 answers name the session the turn is writing to, so a caller
+            # can poll it; echo an explicit-header client's own id per the #13437 contract.
+            session_id=(provided_session_id or session_id),
         )
         if err is not None:
             return err
@@ -842,9 +860,9 @@ class OpenAICompatRoutesMixin:
 
     async def _run_idempotent(
         self, request: "web.Request", body: Dict[str, Any], compute, *,
-        log_label: str, fingerprint_keys: List[str], route: str) -> tuple:
+        log_label: str, fingerprint_keys: List[str], route: str, session_id: str = "") -> tuple:
         """Run ``compute()`` once per (principal scope, logical route, Idempotency-Key) + body fingerprint
-        -> ``((result, usage), None)`` or ``(None, 500 response)``.
+        -> ``((result, usage), None)`` or ``(None, response)``.
 
         ``_idem_cache`` is process-global: under ``gateway.multiplex_profiles`` every profile's
         ``/p/<profile>/v1/...`` mirror shares it, so the key carries ``_run_idempotency_scope`` (the same
@@ -852,22 +870,179 @@ class OpenAICompatRoutesMixin:
         colliding across profiles, or a rotated API_SERVER_KEY, never replays another principal's response.
         ``route`` is the logical endpoint (``/v1/...`` and its ``/p/<profile>/v1/...`` alias are the same
         route), folded into the key because the store keeps the fingerprint only as the slot's value.
+
+        SUP-53 / DD-DENNIS-009 — two properties this helper owns for the synchronous paths:
+
+        * **The gateway answers a slow turn, not the proxy.** ``compute()`` runs as a task under
+          ``sync_turn_deadline_seconds``; past it the caller gets the API's JSON 504
+          (``gateway_timeout``) carrying this session id and a poll pointer, while the turn keeps
+          running and is accounted for when it lands (D1 + D2).
+        * **A retry cannot buy a second turn.** With an ``Idempotency-Key``, the claim is reserved in
+          the same durable store ``/v1/runs`` uses, so a duplicate is answered with
+          ``duplicate_turn_in_progress`` / ``duplicate_turn_completed`` (or
+          ``idempotency_key_conflict``) instead of a second paid turn (D3). The in-memory cache still
+          replays a completed body inside its TTL, which is what most retries inside 5 minutes hit.
         """
         from gateway.platforms.api_server import _error_response, _idem_cache, _make_request_fingerprint
-        idempotency_key = request.headers.get("Idempotency-Key")
+        idempotency_key = (request.headers.get("Idempotency-Key") or "").strip()
+        scoped_key = fp = ""
+        claim = None
         try:
             if idempotency_key:
+                bad_request = self._invalid_sync_idempotency_key_response(idempotency_key)
+                if bad_request is not None:
+                    return None, bad_request
                 principal_scope = self._run_idempotency_scope(request)
                 scoped_key = f"{principal_scope}\0{route}\0{idempotency_key}"
                 fp = _make_request_fingerprint(body, keys=fingerprint_keys)
-                result, usage = await _idem_cache.get_or_set(scoped_key, fp, compute)
-            else:
-                result, usage = await compute()
-            return (result, usage), None
+                replay = _idem_cache.peek(scoped_key, fp)
+                if replay is not None:
+                    return replay, None
+                claim, claim_error = self._claim_sync_turn(
+                    request, idempotency_key, fp, route, session_id)
+                if claim_error is not None:
+                    return None, claim_error
+            result = await self._run_sync_turn_under_deadline(
+                compute, session_id=session_id, claim=claim, log_label=log_label)
+            if scoped_key:
+                _idem_cache.put(scoped_key, fp, result)
+            if claim is not None:
+                self._settle_sync_turn_claim(claim, "completed")
+            return result, None
+        except _SyncTurnDeadlineExceeded as late:
+            # The turn is detached and still running; its done-callback settles the claim.
+            return None, self._sync_turn_deadline_response(late.session_id, late.deadline_seconds)
         except Exception as e:
+            if claim is not None:
+                self._settle_sync_turn_claim(claim, "failed")
             logger.error("Error running agent for %s: %s", log_label, e, exc_info=True)
             message = "" if getattr(e, "_notification_presentation_suppressed", False) is True else f"Internal server error: {e}"
             return None, _error_response(message, 500, err_type="server_error")
+
+    # -- SUP-53 / DD-DENNIS-009: the gateway's own turn deadline and durable claim ---------------
+
+    @staticmethod
+    def _invalid_sync_idempotency_key_response(idempotency_key: str):
+        """Reject a malformed key exactly as ``/v1/runs`` does (same code, same bounds)."""
+        from gateway.platforms.api_server import _error_response
+        if len(idempotency_key) > 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in idempotency_key):
+            return _error_response(
+                "Idempotency-Key must be 1-255 visible ASCII characters",
+                400, code="invalid_idempotency_key")
+        return None
+
+    def _claim_sync_turn(self, request, idempotency_key: str, fingerprint: str, route: str, session_id: str):
+        """Reserve this synchronous turn in the durable store; ``(claim, None)`` or ``(None, 409)``.
+
+        One store for both surfaces (ratified: Q4). ``/v1/runs`` already inserts
+        ``(scope, key, fingerprint) -> run_id`` inside ``BEGIN IMMEDIATE`` with owner-pid liveness and
+        retention pruning; the synchronous paths need precisely the same three answers — this turn is
+        mine, someone else's turn is live, someone else's turn is over.
+        """
+        from gateway.platforms.api_server import _error_response
+        from gateway.platforms.api_server_runs import TERMINAL_STATUSES, _owner_alive
+        scope = self._run_idempotency_scope(request)
+        claim_id = f"sync_{uuid.uuid4().hex}"
+        claim = {"id": claim_id, "scope": scope, "key": idempotency_key,
+                 "session_id": session_id, "route": route}
+        outcome, record = self._run_idempotency_store.reserve(
+            scope, idempotency_key, fingerprint, claim_id,
+            {"object": "hermes.sync_turn", "status": "running", "session_id": session_id, "route": route},
+            owner_pid=self._run_owner_pid, owner_started=self._run_owner_started)
+        if outcome == "created":
+            return claim, None
+        if outcome == "conflict":
+            return None, _error_response(
+                "Idempotency-Key was already used with a different request payload",
+                409, code="idempotency_key_conflict")
+        stored = (record or {}).get("status") or {}
+        recorded_session = str(stored.get("session_id") or session_id or "")
+        if (str(stored.get("status") or "") not in TERMINAL_STATUSES
+                and _owner_alive(int((record or {}).get("owner_pid") or 0),
+                                 int((record or {}).get("owner_started") or 0))):
+            return None, self._duplicate_sync_turn_response(
+                recorded_session, "duplicate_turn_in_progress",
+                "An agent turn for this Idempotency-Key is still running; it was not duplicated.")
+        return None, self._duplicate_sync_turn_response(
+            recorded_session, "duplicate_turn_completed",
+            "An agent turn for this Idempotency-Key already ran; poll its session instead of re-running it.")
+
+    def _settle_sync_turn_claim(self, claim: Dict[str, Any], status: str) -> None:
+        """Move a durable claim to a terminal status, best-effort (never breaks the response)."""
+        try:
+            self._run_idempotency_store.update_status(claim["id"], {
+                "object": "hermes.sync_turn", "status": status,
+                "session_id": claim.get("session_id", ""), "route": claim.get("route", "")})
+        except Exception:
+            logger.debug("failed to settle sync turn claim %s", claim.get("id"), exc_info=True)
+
+    async def _run_sync_turn_under_deadline(self, compute, *, session_id: str, claim, log_label: str):
+        """Await ``compute()`` under the configured deadline; on expiry detach it and raise.
+
+        ``asyncio.wait`` rather than ``wait_for``: the turn must NOT be cancelled — the caller has
+        just been handed the session id, so the answer it polls for has to be allowed to land. The
+        detached task is tracked for shutdown drain and carries the late-completion accounting.
+        """
+        deadline = float(getattr(self, "_sync_turn_deadline_seconds", 0) or 0)
+        if deadline <= 0:
+            return await compute()
+        started = time.monotonic()
+        task = asyncio.ensure_future(compute())
+        self._track_background_task(task)
+        done, _pending = await asyncio.wait({task}, timeout=deadline)
+        if task in done:
+            return task.result()
+
+        def _on_late(done_task) -> None:
+            elapsed = time.monotonic() - started
+            chars = 0
+            failed = done_task.cancelled()
+            if not failed:
+                try:
+                    result = done_task.result()
+                    if isinstance(result, tuple) and result and isinstance(result[0], dict):
+                        chars = len(str(result[0].get("final_response") or ""))
+                except Exception as exc:
+                    failed = True
+                    logger.warning(
+                        "late_completion session_id=%s failed after the deadline: %r", session_id, exc)
+            self._record_late_completion(session_id, elapsed, chars)
+            if claim is not None:
+                self._settle_sync_turn_claim(claim, "failed" if failed else "completed")
+
+        task.add_done_callback(_on_late)
+        logger.warning(
+            "sync turn exceeded sync_turn_deadline_seconds=%.1fs for %s (session %s); "
+            "answering 504 and leaving the turn running",
+            deadline, log_label, session_id or "unknown")
+        raise _SyncTurnDeadlineExceeded(session_id=session_id, deadline_seconds=deadline)
+
+    @staticmethod
+    def _sync_turn_handoff_payload(session_id: str, **extra) -> Dict[str, Any]:
+        poll_path = f"/api/sessions/{session_id}/messages" if session_id else ""
+        return {"session_id": session_id, "poll": {"method": "GET", "path": poll_path}, **extra}
+
+    def _sync_turn_deadline_response(self, session_id: str, deadline_seconds: int):
+        """504 in the API's own JSON envelope, carrying the handle the proxy's HTML never does."""
+        from gateway.platforms.api_server import _openai_error
+        poll_path = f"/api/sessions/{session_id}/messages" if session_id else ""
+        body = _openai_error(
+            f"The agent turn is still running after {deadline_seconds}s; it was NOT cancelled. "
+            f"Poll GET {poll_path} for its answer instead of retrying — a retry starts a second turn.",
+            err_type="gateway_timeout", code="gateway_timeout")
+        body["hermes"] = self._sync_turn_handoff_payload(
+            session_id, deadline_seconds=deadline_seconds,
+            completed=False, partial=False, failed=False)
+        headers = {"X-Hermes-Session-Id": session_id} if session_id else {}
+        return web.json_response(body, status=504, headers=headers)
+
+    def _duplicate_sync_turn_response(self, session_id: str, code: str, message: str):
+        """409 for a duplicate turn: the caller is told where the work is, not asked to retry."""
+        from gateway.platforms.api_server import _openai_error
+        body = _openai_error(message, err_type="duplicate_turn", code=code)
+        body["hermes"] = self._sync_turn_handoff_payload(session_id)
+        headers = {"X-Hermes-Session-Id": session_id} if session_id else {}
+        return web.json_response(body, status=409, headers=headers)
 
     async def _prepare_sse_response(
         self, request: "web.Request", session_id: Optional[str], gateway_session_key: Optional[str],
@@ -1175,6 +1350,8 @@ class OpenAICompatRoutesMixin:
             request, body, _compute_response, log_label="responses",
             fingerprint_keys=["input", "instructions", "previous_response_id", "conversation", "model", "provider", "model_options", "tools"],
             route="responses",
+            # SUP-53: same handoff on the Responses surface.
+            session_id=session_id,
         )
         if err is not None:
             return err

@@ -1027,6 +1027,24 @@ class _IdempotencyCache:
         while len(self._store) > self._max:
             self._store.popitem(last=False)
 
+    def peek(self, key: str, fingerprint: str):
+        """Return a stored result for ``(key, fingerprint)`` without computing, else ``None``.
+
+        SUP-53 / DD-DENNIS-009: the synchronous paths consult this before reserving a durable
+        claim, so a retry that lands inside the 5-minute window still replays the completed body
+        (the pre-existing behaviour) instead of being told the turn is a duplicate.
+        """
+        self._purge()
+        item = self._store.get(key)
+        if item and item["fp"] == fingerprint:
+            return item["resp"]
+        return None
+
+    def put(self, key: str, fingerprint: str, resp) -> None:
+        """Store an already-computed result so later duplicates replay it in-process."""
+        self._store[key] = {"resp": resp, "fp": fingerprint, "ts": time.time()}
+        self._purge()
+
     async def get_or_set(self, key: str, fingerprint: str, compute_coro):
         self._purge()
         item = self._store.get(key)
@@ -1291,6 +1309,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._metrics_latency_ms: List[float] = []
         self._metrics_last_request_at: Optional[float] = None
         self._metrics_last_heartbeat_at: Optional[float] = None
+        # SUP-53 / DD-DENNIS-009: a synchronous turn that outlived the gateway deadline and then
+        # finished anyway. The answer exists in the session transcript but no caller is holding
+        # the connection, so this is the operator-visible signal that the deadline (or the proxy
+        # budget it is paired with) is misconfigured for the traffic being served.
+        self._late_completions_today: int = 0
+        self._metrics_last_late_completion_at: Optional[float] = None
+        self._sync_turn_deadline_seconds: int = self._resolve_sync_turn_deadline_seconds()
 
     def active_agent_work_count(self) -> int:
         """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
@@ -1389,6 +1414,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return APIServerAdapter._resolve_api_server_int("max_concurrent_runs", default=10)
 
     @staticmethod
+    def _resolve_sync_turn_deadline_seconds() -> int:
+        """gateway.api_server.sync_turn_deadline_seconds (0 disables; default 840; negatives -> 0).
+
+        SUP-53 / DD-DENNIS-009. The gateway — not the reverse proxy in front of it — answers a
+        synchronous turn that runs too long, so the caller always receives the API's JSON error
+        envelope WITH the session id instead of proxy HTML with no handle. The default is paired
+        with the reference deployment's 900s proxy_read_timeout: this value must stay strictly
+        below every proxy read/send timeout serving the listener, or the proxy wins the race and
+        the failure mode returns. See website/docs/developer-guide/programmatic-integration.md.
+        """
+        return APIServerAdapter._resolve_api_server_int("sync_turn_deadline_seconds", default=840)
+
+    @staticmethod
     def _resolve_api_server_int(key: str, *, default: int) -> int:
         """Integer setting under gateway.api_server (unreadable config -> default; negatives -> 0)."""
         try:
@@ -1417,7 +1455,23 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._metrics_requests_today = 0
         self._metrics_messages_today = 0
         self._metrics_tokens_today = 0
+        self._late_completions_today = 0
         self._metrics_latency_ms.clear()
+
+    def _record_late_completion(self, session_id: str, elapsed_s: float, output_chars: int) -> None:
+        """Account for a synchronous turn that outlived the deadline but finished anyway.
+
+        SUP-53 / DD-DENNIS-009 D2: the caller was handed a 504 with the session id, so this is
+        not an error — but a turn that keeps finishing after its client was answered is the
+        signal that ``sync_turn_deadline_seconds`` (or the proxy budget it is paired with) is
+        wrong for the traffic served, and it must be visible without reading transcripts.
+        """
+        self._reset_metrics_if_needed()
+        self._late_completions_today += 1
+        self._metrics_last_late_completion_at = time.time()
+        logger.warning(
+            "late_completion session_id=%s elapsed_s=%.1f output_chars=%d",
+            session_id, max(0.0, elapsed_s), max(0, output_chars))
 
     @staticmethod
     def _total_tokens_from_usage(usage: Optional[Dict[str, Any]]) -> int:
@@ -1453,6 +1507,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "tokens": self._metrics_tokens_today,
                 "latency_p95_ms": self._latency_p95_ms(self._metrics_latency_ms),
             },
+            # SUP-53 / DD-DENNIS-009 D2: synchronous turns answered with a gateway_timeout 504
+            # that nonetheless completed afterwards. Non-zero growth means the deadline (or the
+            # proxy budget it pairs with) is short for this traffic — callers are polling, not
+            # failing, but they are waiting longer than the operator intended.
+            "sync_turn_deadline_seconds": self._sync_turn_deadline_seconds,
+            "late_completions_today": self._late_completions_today,
+            "last_late_completion_at": self._iso_timestamp(self._metrics_last_late_completion_at),
         }
 
     def _publish_runtime_status(self) -> None:

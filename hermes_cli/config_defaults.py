@@ -2230,6 +2230,17 @@ DEFAULT_CONFIG = {
             # /v1/runs beyond this get HTTP 429 + Retry-After, bounding CPU/memory/LLM-quota
             # exhaustion from a request flood. 0 = no cap.
             "max_concurrent_runs": 10,
+            # Deadline (seconds) the gateway itself applies to ONE synchronous turn on
+            # /v1/chat/completions and /v1/responses, after which it answers with its own JSON
+            # 504 (error.code = gateway_timeout) carrying the session id and a poll pointer.
+            # SUP-53 / DD-DENNIS-009: without it the verdict is decided by whatever reverse proxy
+            # is in front, which answers HTML with no session id and invites a duplicate turn.
+            # PAIRED WITH THE PROXY, and the pairing is deploy-critical: this value must be
+            # STRICTLY LESS than every proxy_read_timeout/proxy_send_timeout serving this
+            # listener (the reference deployment is 900s at the proxy, 840s here — see
+            # website/docs/developer-guide/programmatic-integration.md). 0 disables the
+            # deadline and restores pre-SUP-53 behaviour exactly.
+            "sync_turn_deadline_seconds": 840,
             # Cap (chars) on each tool output and tool-call argument string in the stored
             # /v1/responses conversation history used for previous_response_id chaining. The
             # stored history is cumulative, so a few large tool outputs can make one
