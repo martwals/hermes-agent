@@ -150,3 +150,36 @@ def test_the_flag_off_leaves_the_index_uncompacted(monkeypatch, tmp_path):
 
     assert "Search the web" in full
     assert "Write threads" in full
+
+def test_the_flag_wins_over_a_caller_supplied_coding_posture(monkeypatch, tmp_path):
+    """SUP-52 review MAJOR 1: production passes a non-empty set in coding focus.
+
+    ``agent/system_prompt._skills_prompt`` calls
+    ``build_skills_system_prompt(compact_categories=coding_compact_skill_categories(...) or None)``,
+    so an ``is None`` guard around the flag read would ignore ``skills.compact_index`` in exactly the
+    case it exists for and leave every category outside the posture carrying its description.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _skills_tree(tmp_path)
+    (tmp_path / "config.yaml").write_text("skills:\n  compact_index: true\n", encoding="utf-8")
+
+    compact = build_skills_system_prompt(compact_categories=frozenset({"tools"}))
+
+    # Not just the posture's own category: the whole index is names-only.
+    for description in ("Search the web", "Write threads", "Write hooks"):
+        assert description not in compact, f"{description!r} survived a flag-on build"
+    for name in ("web-search", "thread-writer", "thread-hook"):
+        assert name in compact
+
+
+def test_flag_off_still_honours_the_callers_posture(monkeypatch, tmp_path):
+    """The flag must not take over the posture path when it is off."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _skills_tree(tmp_path)
+    (tmp_path / "config.yaml").write_text("skills:\n  compact_index: false\n", encoding="utf-8")
+
+    partial = build_skills_system_prompt(compact_categories=frozenset({"tools"}))
+
+    assert "Search the web" not in partial  # the posture demoted this one
+    assert "Write threads" in partial  # and only this one
+    assert "Write hooks" in partial

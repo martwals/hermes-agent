@@ -1354,18 +1354,20 @@ def build_skills_system_prompt(
         _home_token = set_hermes_home_override(str(skills_dir.parent))
     else:
         skills_dir = get_skills_dir()
-    # Progressive disclosure: ``skills.compact_index`` demotes the whole index to
-    # names-only. Read here, after the home/profile override is bound, so the flag
-    # resolves from the profile whose skills are being indexed. Fail-safe: any
-    # error leaves the index uncompacted (SUP-52).
-    if compact_categories is None:
+    # Progressive disclosure (SUP-52). The config flag is **authoritative when it is on**: the
+    # ``COMPACT_ALL_CATEGORIES`` sentinel demotes the whole index regardless of the coding posture, so
+    # it is read even when a caller supplied its own categories — ``system_prompt._skills_prompt``
+    # passes a non-empty set in coding focus, and an ``is None`` guard here would silently ignore the
+    # flag in exactly that case (SUP-52 review, MAJOR 1). Fail-safe: any error leaves the caller's
+    # value untouched, so a broken config cannot destroy a posture's own compaction.
+    if compact_categories is None or COMPACT_ALL_CATEGORIES not in compact_categories:
         try:
             from agent.skill_utils import get_compact_skill_index
 
             if get_compact_skill_index():
                 compact_categories = frozenset({COMPACT_ALL_CATEGORIES})
         except Exception:
-            compact_categories = None
+            pass
     try:
         external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
         # Trusted project-local dirs — highest-precedence tier; cwd/trust are session-stable, so byte-stable.
